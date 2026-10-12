@@ -33,34 +33,39 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
     private var server: BluetoothServerSocket? = null
     private var gatt: BluetoothGattServer? = null
     private var acceptor: Job? = null
-    private var running = false
+    @Volatile private var running = false
+    @Volatile private var generation = 0L
     private var active: BluetoothByteChannel? = null
     private var activeDevice: BluetoothDevice? = null
-    private val advertising = object : AdvertiseCallback() {
-        override fun onStartFailure(errorCode: Int) { failed(Failure.unsupported) }
-    }
-    private val callback = object : BluetoothGattServerCallback() {
+    private var advertising: AdvertiseCallback? = null
+    private fun callback(cycle: Long) = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
-            if (status == BluetoothGatt.GATT_SUCCESS) advertise() else failed(Failure.unsupported)
+            if (!current(cycle)) return
+            if (status == BluetoothGatt.GATT_SUCCESS) advertise(cycle) else failed(Failure.unsupported)
         }
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
+            if (!current(cycle)) return
             try {
-            val bytes = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort((server?.psm ?: 0).toShort()).array()
-            if (offset !in 0..bytes.size || characteristic.uuid != PSM) gatt?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
-            else gatt?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, bytes.copyOfRange(offset, bytes.size))
+                val bytes = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort((server?.psm ?: 0).toShort()).array()
+                if (offset !in 0..bytes.size || characteristic.uuid != PSM) gatt?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                else gatt?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, bytes.copyOfRange(offset, bytes.size))
             } catch (_: SecurityException) { failed(Failure.permissionDenied) }
         }
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (!current(cycle)) return
             if (newState == BluetoothProfile.STATE_CONNECTED && adapter.isLe2MPhySupported) {
                 try { gatt?.setPreferredPhy(device, BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_OPTION_NO_PREFERRED) }
                 catch (_: SecurityException) { failed(Failure.permissionDenied) }
             }
-            if (newState == BluetoothProfile.STATE_DISCONNECTED && device == activeDevice) {
-                activeDevice = null
-                scope.launch { session.disconnect(); if (running) advertise() }
+            val channel = synchronized(this@BLEPeripheral) { active.takeIf { device == activeDevice } }
+            if (newState == BluetoothProfile.STATE_DISCONNECTED && channel != null) {
+                // Close this link only; the session read loop emits its own disconnect event.
+                scope.launch { channel.close() }
             }
         }
     }
+    private fun current(cycle: Long) = running && generation == cycle
+    @Synchronized
     fun start() {
         if (running) return
         if (context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED ||
@@ -69,44 +74,95 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
         if (!adapter.isEnabled || !adapter.isMultipleAdvertisementSupported) fail(Failure.unsupported)
         settings.loadKey()
         running = true
+        val cycle = ++generation
         server = adapter.listenUsingInsecureL2capChannel()
-        gatt = manager.openGattServer(context, callback) ?: fail(Failure.unsupported)
+        gatt = manager.openGattServer(context, callback(cycle)) ?: fail(Failure.unsupported)
         val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         service.addCharacteristic(BluetoothGattCharacteristic(PSM, BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ))
         if (!gatt!!.addService(service)) fail(Failure.unsupported)
+        val listener = server ?: fail(Failure.unsupported)
         acceptor = scope.launch(Dispatchers.IO) {
-            while (running) {
-                val socket = try { server?.accept() ?: break } catch (_: Exception) { break }
-                if (session.connected != null) { socket.close(); continue }
+            while (current(cycle)) {
+                val socket = try { listener.accept() } catch (_: Exception) { break }
+                if (!current(cycle) || session.connected != null) { socket.close(); continue }
                 val raw = BluetoothByteChannel(socket)
+                val accepted = synchronized(this@BLEPeripheral) {
+                    if (!current(cycle)) false else { active = raw; activeDevice = null; true }
+                }
+                if (!accepted) { raw.close(); break }
                 val timeout = launch { delay(5000); raw.close() }
                 try {
                     val auth = Handshake.authenticate(raw, Role.ANDROID, settings.identity, settings.loadKey(), transport = Transport.ble, expectedPeer = settings.mac)
-                    timeout.cancel(); settings.mac = auth.peer; active = raw; activeDevice = socket.remoteDevice
-                    adapter.bluetoothLeAdvertiser?.stopAdvertising(advertising)
+                    timeout.cancel()
+                    ensureActive()
+                    val valid = synchronized(this@BLEPeripheral) {
+                        if (!current(cycle) || active !== raw) false
+                        else { settings.mac = auth.peer; activeDevice = socket.remoteDevice; stopAdvertising(); true }
+                    }
+                    if (!valid) { raw.close(); break }
                     session.installBLE(auth, EncryptedChannel(raw, auth, Transport.ble))
-                } catch (_: SecurityException) { timeout.cancel(); raw.close(); failed(Failure.permissionDenied) }
-                catch (_: Exception) { timeout.cancel(); raw.close(); failed(Failure.authenticationFailed) }
+                } catch (cancelled: CancellationException) { raw.close(); throw cancelled }
+                catch (_: SecurityException) { raw.close(); if (current(cycle)) failed(Failure.permissionDenied) }
+                catch (_: Exception) { raw.close(); if (current(cycle)) failed(Failure.authenticationFailed) }
+                finally {
+                    timeout.cancel()
+                    synchronized(this@BLEPeripheral) {
+                        if (current(cycle) && session.connected == null && active === raw) {
+                            active = null; activeDevice = null; advertise()
+                        }
+                    }
+                }
             }
         }
         } catch (_: SecurityException) { stop(); fail(Failure.permissionDenied) }
     }
-    private fun advertise() {
-        if (!running) return
+    @Synchronized
+    private fun advertise(cycle: Long = generation) {
+        if (!current(cycle) || session.connected != null || advertising != null) return
         try {
-        adapter.bluetoothLeAdvertiser?.stopAdvertising(advertising)
-        adapter.bluetoothLeAdvertiser?.startAdvertising(
-            AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER).setConnectable(true).build(),
-            AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).build(),
-            AdvertiseData.Builder().setIncludeDeviceName(true).build(), advertising)
-        } catch (_: SecurityException) { failed(Failure.permissionDenied) }
+            val advertiser = adapter.bluetoothLeAdvertiser ?: return failed(Failure.unsupported)
+            val callback = object : AdvertiseCallback() {
+                override fun onStartFailure(errorCode: Int) {
+                    synchronized(this@BLEPeripheral) {
+                        if (!current(cycle) || advertising !== this) return
+                        advertising = null
+                        failed(Failure.unsupported)
+                    }
+                }
+            }
+            advertising = callback
+            advertiser.startAdvertising(
+                AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER).setConnectable(true).build(),
+                AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).build(),
+                AdvertiseData.Builder().setIncludeDeviceName(true).build(), callback)
+        } catch (_: SecurityException) { advertising = null; failed(Failure.permissionDenied) }
     }
-    fun stop() {
-        running = false; acceptor?.cancel(); active?.close(); active = null
+    @Synchronized
+    private fun stopAdvertising() {
+        val callback = advertising ?: return
+        advertising = null
+        try { adapter.bluetoothLeAdvertiser?.stopAdvertising(callback) }
+        catch (_: SecurityException) { failed(Failure.permissionDenied) }
+    }
+    @Synchronized
+    fun sessionDisconnected() {
+        // A previous session's event must not close a newer connection or handshake.
+        if (session.connected != null || (active != null && activeDevice == null)) return
+        active?.close(); active = null; activeDevice = null
+        if (running) advertise()
+    }
+    @Synchronized
+    fun stop(): Job? {
+        running = false; generation++
+        val pending = acceptor
+        pending?.cancel(); acceptor = null
+        active?.close(); active = null
         runCatching { server?.close() }; server = null
-        try { gatt?.close(); adapter.bluetoothLeAdvertiser?.stopAdvertising(advertising) }
+        stopAdvertising()
+        try { gatt?.close() }
         catch (_: SecurityException) { failed(Failure.permissionDenied) }
         gatt = null; activeDevice = null
+        return pending
     }
     companion object {
         val SERVICE: UUID = UUID.fromString("3c633de1-c3e5-4e81-a593-9adf6d4a419f")

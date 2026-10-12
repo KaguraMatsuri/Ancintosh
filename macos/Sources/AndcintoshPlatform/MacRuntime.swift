@@ -97,6 +97,10 @@ public final class MacRuntime {
         refreshPermissions()
         _ = bluetooth
         configureLock()
+        for profile in configuration.peers {
+            do { try bluetooth.connect(identifier: profile.id, key: KeychainStore.load(peer: profile.id), expectedIdentity: profile.identity) }
+            catch { failures[profile.id] = error as? ProtocolFailure ?? .peerUnavailable }
+        }
         pasteboard.changed = { [weak self] file, text, mime in
             guard let self else { return }
             Task {
@@ -237,6 +241,7 @@ public final class MacRuntime {
     private func event(_ event: SyncEvent) async throws {
         switch event {
         case .connected(let peer):
+            guard running, bluetooth.sessionAuthenticated(peer) else { return }
             failures.removeValue(forKey: peer)
             connected.insert(peer); locker.connected(peer); pasteboard.start()
             if pasteboard.permitted {
@@ -246,6 +251,7 @@ public final class MacRuntime {
             scheduleOffer(peer)
         case .disconnected(let peer, let intentional):
             connected.remove(peer); locker.disconnected(peer, intentional: intentional)
+            bluetooth.sessionDisconnected(peer, intentional: intentional)
             offers.removeValue(forKey: peer)?.cancel()
             if connected.isEmpty { pasteboard.stop(); await server.stop() }
         case .received(_, let manifest, let url): if manifest.kind != .file { try pasteboard.apply(manifest, file: url) }

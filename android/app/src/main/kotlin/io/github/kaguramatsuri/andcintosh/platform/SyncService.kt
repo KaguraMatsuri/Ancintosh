@@ -50,7 +50,7 @@ class SyncService : Service() {
                 if (!status.value.running) return@launch
                 try {
                     when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
-                        BluetoothAdapter.STATE_OFF -> { session.disconnect(); peripheral.stop() }
+                        BluetoothAdapter.STATE_OFF -> { peripheral.stop()?.join(); session.disconnect() }
                         BluetoothAdapter.STATE_ON -> peripheral.start()
                     }
                 } catch (error: Exception) { report(error) }
@@ -64,7 +64,10 @@ class SyncService : Service() {
         val store = TransferStore(File(filesDir, "state")) { file, manifest -> FileAccess.publish(this, file, manifest) }
         files = FileAccess(this, store, settings.identity)
         session = SessionController(settings.identity, scope, store) { event ->
+            if (event is SyncEvent.Connected && session.connected != event.peer) return@SessionController
+            if (event is SyncEvent.Disconnected && session.connected != null) return@SessionController
             if (event is SyncEvent.Delivered) files.apply(event.result)
+            if (event is SyncEvent.Disconnected && ::peripheral.isInitialized) peripheral.sessionDisconnected()
             if (event is SyncEvent.Offer) scope.launch { tcp.connect(event) }
             mutableStatus.update { current ->
                 when (event) {
@@ -122,7 +125,7 @@ class SyncService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
     suspend fun saveKey(hex: String) {
         Crypto.key(hex)
-        session.disconnect(true); peripheral.stop()
+        peripheral.stop()?.join(); session.disconnect(true)
         DeviceSettings(this).saveKey(hex)
         peripheral.start()
         mutableStatus.update { it.copy(ready = true, failure = null) }
@@ -165,7 +168,7 @@ class SyncService : Service() {
     suspend fun stopSync() {
         startup?.cancelAndJoin()
         mutableStatus.update { it.copy(running = false, ready = false) }
-        session.disconnect(true); peripheral.stop(); tcp.stop()
+        peripheral.stop()?.join(); session.disconnect(true); tcp.stop()
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
     private fun report(error: Exception) {
