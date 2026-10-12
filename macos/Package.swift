@@ -14,5 +14,6 @@ let package = Package(
         .target(name: "AndcintoshPlatform", dependencies: ["AndcintoshCore"]),
         .executableTarget(name: "AndcintoshApp", dependencies: ["AndcintoshPlatform", "AndcintoshCore"]),
         .testTarget(name: "AndcintoshCoreTests", dependencies: ["AndcintoshCore"]),
+        .testTarget(name: "AndcintoshPlatformTests", dependencies: ["AndcintoshPlatform", "AndcintoshCore"]),
     ]
 )

@@ -83,14 +83,19 @@ struct MainView: View {
                     .disabled(runtime.configuration.primary == nil)
                 Text("主 Android 连接并通过认证后生效；意外断连 15 秒后锁定，期间重连则取消。主动停止不会锁定。").foregroundStyle(.secondary)
                 if !runtime.lockAllowed {
-                    Button("允许锁定所需的辅助功能权限") { _ = runtime.requestLockAuthorization(); runtime.refreshPermissions() }
-                        .accessibilityLabel("允许锁定所需的辅助功能权限")
+                    if runtime.lockAuthorizationRequested {
+                        Button("打开系统设置") { openSystemSettings() }
+                            .accessibilityLabel("打开系统设置")
+                    } else {
+                        Button("允许锁定所需的辅助功能权限") { _ = runtime.requestLockAuthorization() }
+                            .accessibilityLabel("允许锁定所需的辅助功能权限")
+                    }
                 }
             }
             if !runtime.clipboardAllowed {
                 Section("粘贴板权限") {
                     Text(Copy.clipboardHelp)
-                    Button("打开系统设置") { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app")) }
+                    Button("打开系统设置") { openSystemSettings() }
                 }
             }
             if let failure = runtime.failures.values.first {
@@ -105,6 +110,7 @@ struct MainView: View {
             Button("确定", role: .cancel) { error = nil }
         } message: { Text(error ?? "") }
     }
+    private func openSystemSettings() { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app")) }
     private func perform(_ action: @escaping @MainActor () async throws -> Void) {
         busy = true
         Task { defer { busy = false }; do { try await action() } catch { self.error = Copy.failure(error) } }

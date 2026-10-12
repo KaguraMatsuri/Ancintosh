@@ -10,9 +10,23 @@ public final class LockController {
     private let start = ContinuousClock.now
     private var pending: Task<Void, Never>?
     private var activity: NSObjectProtocol?
-    public init() {}
-    public var permitted: Bool { CGPreflightPostEventAccess() }
-    public func requestAuthorization() -> Bool { CGRequestPostEventAccess() }
+    private let authorizationCheck: () -> Bool
+    private let authorizationRequest: () -> Bool
+    public private(set) var authorizationRequested = false
+    public convenience init() {
+        self.init(authorizationCheck: { CGPreflightPostEventAccess() }, authorizationRequest: { CGRequestPostEventAccess() })
+    }
+    init(authorizationCheck: @escaping () -> Bool, authorizationRequest: @escaping () -> Bool) {
+        self.authorizationCheck = authorizationCheck
+        self.authorizationRequest = authorizationRequest
+    }
+    public var permitted: Bool { authorizationCheck() }
+    public func requestAuthorization() -> Bool {
+        if permitted { return true }
+        guard !authorizationRequested else { return false }
+        authorizationRequested = true
+        return authorizationRequest()
+    }
     public func configure(enabled: Bool, primary: UUID?) throws {
         if enabled && !permitted { throw ProtocolFailure.permissionDenied }
         state.configure(enabled: enabled, primary: primary)

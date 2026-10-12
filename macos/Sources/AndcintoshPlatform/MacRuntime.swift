@@ -42,6 +42,7 @@ public final class MacRuntime {
     public private(set) var transfers: [UUID: MacTransfer] = [:]
     public private(set) var clipboardAllowed = false
     public private(set) var lockAllowed = false
+    public private(set) var lockAuthorizationRequested = false
     private let store: TransferStore
     private let pasteboard = PasteboardBridge()
     private let locker = LockController()
@@ -146,7 +147,12 @@ public final class MacRuntime {
         configuration.lockEnabled = enabled; configuration.primary = primary; persist()
         if let identity, connected.contains(identity) { locker.connected(identity) }
     }
-    public func requestLockAuthorization() -> Bool { locker.requestAuthorization() }
+    public func requestLockAuthorization() -> Bool {
+        let allowed = locker.requestAuthorization()
+        lockAuthorizationRequested = locker.authorizationRequested
+        refreshPermissions()
+        return allowed
+    }
     public func files(_ urls: [URL], peer: UUID) async throws {
         guard connected.contains(peer) else { throw ProtocolFailure.peerUnavailable }
         preparing = true
