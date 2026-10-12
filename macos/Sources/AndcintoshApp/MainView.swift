@@ -72,13 +72,13 @@ struct MainView: View {
             }
             Section("断连锁定") {
                 Picker("主 Android", selection: Binding(get: { runtime.configuration.primary }, set: { primary in
-                    do { try runtime.lock(enabled: runtime.configuration.lockEnabled, primary: primary) } catch { self.error = Copy.failure(error) }
+                    configureLock(enabled: runtime.configuration.lockEnabled, primary: primary)
                 })) {
                     Text("未选择").tag(Optional<UUID>.none)
                     ForEach(runtime.configuration.peers) { profile in Text(profile.name ?? profile.id.uuidString).tag(Optional(profile.id)) }
                 }
                 Toggle("断连后锁定 Mac", isOn: Binding(get: { runtime.configuration.lockEnabled }, set: { enabled in
-                    do { try runtime.lock(enabled: enabled, primary: runtime.configuration.primary) } catch { self.error = Copy.failure(error) }
+                    configureLock(enabled: enabled, primary: runtime.configuration.primary)
                 }))
                     .disabled(runtime.configuration.primary == nil)
                 Text("主 Android 连接并通过认证后生效；意外断连 15 秒后锁定，期间重连则取消。主动停止不会锁定。").foregroundStyle(.secondary)
@@ -109,6 +109,18 @@ struct MainView: View {
         .alert("操作未完成", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("确定", role: .cancel) { error = nil }
         } message: { Text(error ?? "") }
+    }
+    private func configureLock(enabled: Bool, primary: UUID?) {
+        if enabled {
+            runtime.refreshPermissions()
+            if !runtime.lockAllowed {
+                if runtime.lockAuthorizationRequested { openSystemSettings() }
+                else { _ = runtime.requestLockAuthorization() }
+                guard runtime.lockAllowed else { return }
+            }
+        }
+        do { try runtime.lock(enabled: enabled, primary: primary) }
+        catch { self.error = Copy.failure(error) }
     }
     private func openSystemSettings() { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app")) }
     private func perform(_ action: @escaping @MainActor () async throws -> Void) {
