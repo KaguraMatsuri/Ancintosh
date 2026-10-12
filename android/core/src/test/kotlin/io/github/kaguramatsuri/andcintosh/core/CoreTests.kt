@@ -5,10 +5,84 @@ import java.nio.file.Files
 import java.util.UUID
 import kotlin.test.*
 import org.json.JSONObject
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
+import java.nio.ByteBuffer
 
 class CoreTests {
     private val mac = UUID.fromString("11111111-1111-1111-1111-111111111111")
     private val phone = UUID.fromString("22222222-2222-2222-2222-222222222222")
+    @Test fun cancellingActiveFileKeepsAuthenticatedConnection() = runBlocking {
+        val root = Files.createTempDirectory("andcintosh-active-cancel").toFile()
+        val scope = CoroutineScope(SupervisorJob() + coroutineContext.minusKey(Job))
+        val input = Channel<Byte>(Channel.UNLIMITED)
+        val blocked = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val local = Hello(Role.ANDROID, phone, nonce = ByteArray(32) { 1 })
+        val remote = Hello(Role.MAC, mac, nonce = ByteArray(32) { 2 })
+        val key = ByteArray(32) { 3 }
+        val peerCrypto = CryptoSession(key, remote, local, Transport.ble)
+        val auth = Authentication(mac, CryptoSession(key, local, remote, Transport.ble))
+        val epochBytes = ByteBuffer.wrap(auth.crypto.root)
+        val epoch = UUID(epochBytes.long, epochBytes.long)
+        val writes = mutableListOf<RecordKind>(); val disconnects = mutableListOf<SyncEvent.Disconnected>()
+        val raw = object : ByteChannel {
+            override suspend fun readExactly(count: Int): ByteArray = ByteArray(count) { input.receive() }
+            override suspend fun write(data: ByteArray) {
+                val record = peerCrypto.open(data)
+                writes.add(record.kind)
+                if (record.kind == RecordKind.BEGIN) {
+                    peerCrypto.seal(Record(RecordKind.RESUME, record.id, epoch = epoch)).forEach { input.send(it) }
+                }
+                if (record.kind == RecordKind.DATA) { blocked.complete(Unit); release.await() }
+            }
+            override fun close() { input.close() }
+        }
+        try {
+            val store = TransferStore(root) { _, _ -> error("Unexpected publication") }
+            val session = SessionController(phone, scope, store) { if (it is SyncEvent.Disconnected) disconnects.add(it) }
+            session.installBLE(auth, EncryptedChannel(raw, auth, Transport.ble))
+            val source = store.snapshot(ByteArray(16384) { 7 }.inputStream(), PayloadKind.FILE, "active.bin", "application/octet-stream", phone)
+            session.enqueue(source)
+            withTimeout(2000) { blocked.await() }
+            val cancellation = launch { session.cancel(source.manifest.id) }
+            yield()
+            assertFalse(source.file.exists())
+            release.complete(Unit)
+            withTimeout(2000) { cancellation.join() }
+            yield()
+            assertEquals(mac, session.connected)
+            assertTrue(disconnects.isEmpty())
+            assertTrue(session.outgoingFiles().isEmpty())
+            assertEquals(1, writes.count { it == RecordKind.DATA })
+            assertTrue(RecordKind.CANCEL in writes)
+            session.disconnect(true)
+        } finally { release.complete(Unit); scope.cancel(); input.close(); root.deleteRecursively() }
+    }
+    @Test fun cancellingRestoredOfflineFileDeletesSnapshotAndJournalEntry() = runBlocking {
+        val root = Files.createTempDirectory("andcintosh-cancel").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val store = TransferStore(root) { _, _ -> error("No incoming file should publish") }
+            val source = store.snapshot(byteArrayOf(1, 2, 3).inputStream(), PayloadKind.FILE, "cancel.bin", "application/octet-stream", phone)
+            store.persist(listOf(OutboundJob(mac, source, true)))
+            val controller = SessionController(phone, scope, store) { }
+            controller.restore()
+            assertEquals(1, controller.outgoingFiles().size)
+            controller.cancel(source.manifest.id)
+            assertFalse(source.file.exists())
+            assertTrue(controller.outgoingFiles().isEmpty())
+            assertTrue(TransferStore(root) { _, _ -> error("Unexpected publication") }.restore().isEmpty())
+        } finally { scope.cancel(); root.deleteRecursively() }
+    }
     @Test fun independentJavaFixture() {
         val j = JSONObject(File("../../protocol/fixtures/v1.json").readText())
         val a = Hello.decode(j.getString("macHello").unhex()); val b = Hello.decode(j.getString("androidHello").unhex())

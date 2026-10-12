@@ -22,6 +22,7 @@ private struct PeerChannels {
     var route = TransportCoordinator()
     var offer: TCPOffer?
     var epoch = Wire.zeroID
+    var switching = false
 }
 
 public actor SyncCoordinator {
@@ -35,6 +36,8 @@ public actor SyncCoordinator {
     private var localWifi = true
     private var currentClipboard: URL?
     private var activeSource: URL?
+    private var activeJob: (peer: UUID, id: UUID)?
+    private var activeCancelled = false
     private var lastProgress: [UUID: ContinuousClock.Instant] = [:]
 
     public init(identity: UUID, role: PeerRole, store: TransferStore,
@@ -47,6 +50,7 @@ public actor SyncCoordinator {
     }
 
     public func connectedPeers() -> Set<UUID> { Set(peers.keys) }
+    public func outgoingFiles() -> [OutboundJob] { scheduler.jobs.filter { $0.manifest.kind == .file } }
     public func usingTCP(_ peer: UUID) -> Bool { peers[peer]?.tcp != nil }
     public func bleRoot(_ peer: UUID) -> Data? { peers[peer]?.ble.root }
     public func permitsWifi(_ peer: UUID) -> Bool {
@@ -105,9 +109,16 @@ public actor SyncCoordinator {
         entry.tcp = channel
         entry.tcpGeneration = UUID()
         entry.epoch = context
+        entry.switching = true
         try entry.route.activateTCP()
         peers[peer] = entry
         await store.selectEpoch(peer: peer, epoch: entry.epoch)
+        guard var current = peers[peer], current.epoch == context, current.tcp === channel else {
+            await channel.close(); throw ProtocolFailure.peerUnavailable
+        }
+        current.switching = false
+        peers[peer] = current
+        if !permitsWifi(peer) { await fallback(peer); throw ProtocolFailure.peerUnavailable }
         scheduler.channelChanged(peer)
         let generation = entry.tcpGeneration!
         Task { await self.readLoop(peer, channel: channel, generation: generation, tcp: true) }
@@ -154,7 +165,9 @@ public actor SyncCoordinator {
     }
 
     public func cancel(_ id: UUID, peer: UUID) async {
-        let previous = scheduler.jobs.first(where: { $0.peer == peer && $0.manifest.id == id })?.snapshot
+        let cancelsActive = activeJob?.peer == peer && activeJob?.id == id
+        if cancelsActive { activeCancelled = true }
+        let previous = scheduler.jobs.first(where: { $0.peer == peer && $0.manifest.id == id })?.snapshot ?? (cancelsActive ? activeSource : nil)
         scheduler.remove(id, peer: peer)
         try? await store.persistOutgoing(scheduler.jobs)
         if let channel = dataChannel(peer), let epoch = peers[peer]?.epoch { try? await channel.send(Record(.cancel, transferID: id, epoch: epoch)) }
@@ -190,7 +203,7 @@ public actor SyncCoordinator {
 
     private func receive(_ record: Record, from peer: UUID, channel: EncryptedChannel, tcp: Bool) async throws {
         let isTransfer = [.begin, .data, .finish, .acknowledge, .resume, .cancel, .failure].contains(record.kind)
-        if isTransfer && (record.epoch != peers[peer]?.epoch || channel !== dataChannel(peer)) { return }
+        if isTransfer && (peers[peer]?.switching != false || record.epoch != peers[peer]?.epoch || channel !== dataChannel(peer)) { return }
         do {
             switch record.kind {
             case .begin:
@@ -236,6 +249,7 @@ public actor SyncCoordinator {
                     }
                 }
             case .cancel:
+                if activeJob?.peer == peer && activeJob?.id == record.transferID { activeCancelled = true }
                 scheduler.remove(record.transferID, peer: peer)
                 await store.cancel(peer: peer, id: record.transferID)
                 try await store.persistOutgoing(scheduler.jobs)
@@ -265,14 +279,18 @@ public actor SyncCoordinator {
                     await fallback(peer)
                 } else {
                     guard record.epoch != Wire.zeroID, var entry = peers[peer] else { throw ProtocolFailure.invalidFrame }
+                    if record.epoch == entry.epoch && entry.tcp == nil && !entry.switching { return }
                     let old = entry.tcp
                     entry.tcp = nil; entry.tcpGeneration = nil; entry.offer = nil
-                    entry.epoch = record.epoch; entry.route.tcpLost()
+                    entry.epoch = record.epoch; entry.route.tcpLost(); entry.switching = true
                     peers[peer] = entry
                     await store.selectEpoch(peer: peer, epoch: entry.epoch)
                     try await store.checkpoint(peer)
                     scheduler.channelChanged(peer)
                     await old?.close()
+                    if var current = peers[peer], current.epoch == record.epoch {
+                        current.switching = false; peers[peer] = current
+                    }
                 }
             case .failure:
                 let failure = try Wire.decodeJSON(FailureMessage.self, record.metadata)
@@ -310,16 +328,28 @@ public actor SyncCoordinator {
 
     private func fallback(_ peer: UUID) async {
         guard var entry = peers[peer] else { return }
+        if entry.switching { return }
         let old = entry.tcp
-        if old != nil { entry.epoch = UUID() }
+        let changing = old != nil || entry.offer != nil
+        if !changing {
+            if role == .mac {
+                try? await entry.ble.send(Record(.transportSwitch, metadata: Wire.encodeJSON(SwitchMessage(transport: .ble)), epoch: entry.epoch))
+            }
+            return
+        }
+        if role == .mac { entry.epoch = UUID() }
+        entry.switching = true
         entry.tcp = nil; entry.tcpGeneration = nil; entry.offer = nil; entry.route.tcpLost()
         peers[peer] = entry
-        await store.selectEpoch(peer: peer, epoch: entry.epoch)
-        scheduler.channelChanged(peer)
         try? await store.checkpoint(peer)
         await old?.close()
         if role == .mac {
+            await store.selectEpoch(peer: peer, epoch: entry.epoch)
+            scheduler.channelChanged(peer)
             try? await entry.ble.send(Record(.transportSwitch, metadata: Wire.encodeJSON(SwitchMessage(transport: .ble)), epoch: entry.epoch))
+            if var current = peers[peer], current.epoch == entry.epoch {
+                current.switching = false; peers[peer] = current
+            }
         } else {
             try? await entry.ble.send(Record(.transportSwitch, metadata: Wire.encodeJSON(SwitchMessage(transport: .ble))))
         }
@@ -331,12 +361,14 @@ public actor SyncCoordinator {
         defer {
             pumping = false
             activeSource = nil
+            activeJob = nil
             Task {
                 await self.collectClipboard()
-                if self.scheduler.ready(available: Set(self.peers.keys)) { self.schedulePump() }
+                if self.scheduler.ready(available: Set(self.peers.filter { !$0.value.switching }.keys)) { self.schedulePump() }
             }
         }
-        while var job = scheduler.next(available: Set(peers.keys)) {
+        while var job = scheduler.next(available: Set(peers.filter { !$0.value.switching }.keys)) {
+            activeJob = (job.peer, job.manifest.id); activeCancelled = false
             activeSource = job.snapshot
             guard let channel = dataChannel(job.peer) else { scheduler.requeue(job); return }
             guard let epoch = peers[job.peer]?.epoch else { scheduler.requeue(job); return }
@@ -347,8 +379,11 @@ public actor SyncCoordinator {
                     try await channel.send(Record(.begin, transferID: job.manifest.id, metadata: Wire.encodeJSON(job.manifest), epoch: epoch))
                 } else if job.offset < job.manifest.size {
                     let count = channel.transport == .tcp ? Wire.tcpChunkSize : Wire.bleChunkSize
-                    let bytes = try await store.read(job.snapshot, offset: job.offset, count: min(count, Int(job.manifest.size - job.offset)))
-                    if epoch != peers[job.peer]?.epoch {
+                    let bytes: Data
+                    do { bytes = try await store.read(job.snapshot, offset: job.offset, count: min(count, Int(job.manifest.size - job.offset))) }
+                    catch { throw ProtocolFailure.sourceUnavailable }
+                    if activeCancelled { continue }
+                    if epoch != peers[job.peer]?.epoch || channel !== dataChannel(job.peer) || peers[job.peer]?.switching != false {
                         job.begun = false; job.waitingForResume = false; scheduler.requeue(job); continue
                     }
                     guard !bytes.isEmpty else { throw ProtocolFailure.sourceUnavailable }
@@ -367,8 +402,14 @@ public actor SyncCoordinator {
                     try await channel.send(Record(.finish, transferID: job.manifest.id, offset: job.offset, epoch: epoch))
                 }
             } catch {
+                if activeCancelled { continue }
                 if error is ProtocolFailure && (error as? ProtocolFailure) == .sourceUnavailable {
                     scheduler.remove(job.manifest.id, peer: job.peer)
+                    if job.manifest.kind == .file {
+                        job.failure = .sourceUnavailable; job.begun = false; job.waitingForResume = false; job.finished = false
+                        scheduler.requeue(job)
+                        try? await store.persistOutgoing(scheduler.jobs)
+                    }
                     try? await events(.failed(job.peer, job.manifest.id, .sourceUnavailable))
                 } else {
                     scheduler.channelChanged(job.peer)

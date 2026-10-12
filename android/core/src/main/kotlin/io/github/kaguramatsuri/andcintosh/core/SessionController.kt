@@ -35,6 +35,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     var wifi = true; private set
     @Volatile private var remoteWifi = true
     val connected: UUID? get() = peer
+    suspend fun outgoingFiles(): List<OutboundJob> = state.withLock { queue.filter { it.snapshot.manifest.kind == PayloadKind.FILE }.map { it.copy() } }
     suspend fun restore() = state.withLock { queue.addAll(store.restore()) }
 
     suspend fun installBLE(auth: Authentication, channel: EncryptedChannel) {
@@ -91,8 +92,12 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         pump()
     }
     suspend fun cancel(id: UUID) {
-        state.withLock { queue.removeAll { it.snapshot.manifest.id == id }; store.persist(queue) }
-        (tcp ?: ble)?.send(Record(RecordKind.CANCEL, id))
+        val source = state.withLock {
+            val source = queue.firstOrNull { it.snapshot.manifest.id == id }?.snapshot?.file
+            queue.removeAll { it.snapshot.manifest.id == id }; store.persist(queue); source
+        }
+        if (source != null) store.release(source)
+        runCatching { (tcp ?: ble)?.send(Record(RecordKind.CANCEL, id, epoch = epoch)) }
         peer?.let { store.cancel(it, id) }; pump()
     }
     private suspend fun reset() = state.withLock { queue.forEach { it.begun = false; it.waiting = false; it.finished = false }; store.persist(queue) }
@@ -109,6 +114,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 } ?: return
                 try {
                     val record = state.withLock {
+                        if (queue.none { it === job }) return@withLock null
                         if (!job.begun) {
                             job.begun = true; job.waiting = true
                             Record(RecordKind.BEGIN, job.snapshot.manifest.id, metadata = job.snapshot.manifest.json().bytes())
@@ -118,7 +124,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                             val offset = job.offset; job.offset += bytes.size
                             Record(RecordKind.DATA, job.snapshot.manifest.id, offset, bytes = bytes)
                         } else { job.finished = true; Record(RecordKind.FINISH, job.snapshot.manifest.id, job.offset) }
-                    }
+                    } ?: continue
                     channel.send(record.copy(epoch = epoch))
                     val now = System.nanoTime()
                     if (job.offset == job.snapshot.manifest.size || now - (lastProgress[job.snapshot.manifest.id] ?: 0L) >= 200_000_000L) {
@@ -218,8 +224,11 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 }
                 RecordKind.FAILURE -> {
                     val code = Failure.valueOf(record.json().getString("code"))
-                    state.withLock { queue.firstOrNull { it.snapshot.manifest.id == record.id }?.failed = code; store.persist(queue) }
-                    events(SyncEvent.Failed(record.id, code))
+                    val pending = state.withLock {
+                        val job = queue.firstOrNull { it.snapshot.manifest.id == record.id } ?: return@withLock false
+                        job.failed = code; store.persist(queue); true
+                    }
+                    if (pending) events(SyncEvent.Failed(record.id, code))
                 }
             }
         } catch (error: ProtocolException) {
