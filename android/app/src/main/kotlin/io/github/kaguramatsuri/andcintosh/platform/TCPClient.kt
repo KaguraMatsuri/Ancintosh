@@ -8,6 +8,8 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import io.github.kaguramatsuri.andcintosh.core.*
 import java.net.InetSocketAddress
+import java.net.Inet6Address
+import java.net.NetworkInterface
 import java.net.Socket
 import kotlinx.coroutines.*
 
@@ -45,8 +47,13 @@ class TCPClient(context: Context, private val scope: CoroutineScope, private val
         val wifi = network ?: return
         for ((host, port) in event.addresses) {
             if (port !in 1..65535) continue
-            val address = runCatching { InetAddresses.parseNumericAddress(host.substringBefore('%')) }.getOrNull() ?: continue
+            var address = runCatching { InetAddresses.parseNumericAddress(host.substringBefore('%')) }.getOrNull() ?: continue
             if (address.isAnyLocalAddress || address.isLoopbackAddress || address.isMulticastAddress) continue
+            if (address is Inet6Address && address.isLinkLocalAddress) {
+                val name = manager.getLinkProperties(wifi)?.interfaceName ?: continue
+                val iface = NetworkInterface.getByName(name) ?: continue
+                address = Inet6Address.getByAddress(null, address.address, iface)
+            }
             val socket = wifi.socketFactory.createSocket()
             socket.tcpNoDelay = true; socket.soTimeout = 5000
             val channel = SocketByteChannel(socket)

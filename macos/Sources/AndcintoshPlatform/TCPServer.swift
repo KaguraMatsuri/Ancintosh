@@ -82,7 +82,7 @@ public actor TCPServer {
         while let item = current {
             defer { current = item.pointee.ifa_next }
             let value = item.pointee
-            guard let address = value.ifa_addr, address.pointee.sa_family == UInt8(AF_INET),
+            guard let address = value.ifa_addr, [UInt8(AF_INET), UInt8(AF_INET6)].contains(address.pointee.sa_family),
                   value.ifa_flags & UInt32(IFF_LOOPBACK) == 0,
                   value.ifa_flags & UInt32(IFF_UP) != 0 else { continue }
             let name = String(cString: value.ifa_name)
