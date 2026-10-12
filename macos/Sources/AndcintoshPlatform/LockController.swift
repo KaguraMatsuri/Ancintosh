@@ -21,6 +21,7 @@ public final class LockController {
         self.authorizationRequest = authorizationRequest
     }
     public var permitted: Bool { authorizationCheck() }
+    public func setDelay(seconds: Int) throws { try state.setDelay(seconds: seconds) }
     public func requestAuthorization() -> Bool {
         if permitted { return true }
         guard !authorizationRequested else { return false }

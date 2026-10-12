@@ -18,7 +18,21 @@ public struct MacConfiguration: Codable, Sendable {
     public var primary: UUID?
     public var lockEnabled = false
     public var wifi = true
+    public var lockDelaySeconds = 15
     public init() {}
+    private enum CodingKeys: String, CodingKey { case identity, peers, primary, lockEnabled, wifi, lockDelaySeconds }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        identity = try values.decode(UUID.self, forKey: .identity)
+        peers = try values.decode([PeerProfile].self, forKey: .peers)
+        primary = try values.decodeIfPresent(UUID.self, forKey: .primary)
+        lockEnabled = try values.decode(Bool.self, forKey: .lockEnabled)
+        wifi = try values.decode(Bool.self, forKey: .wifi)
+        lockDelaySeconds = try values.decodeIfPresent(Int.self, forKey: .lockDelaySeconds) ?? 15
+        guard (1...3600).contains(lockDelaySeconds) else {
+            throw DecodingError.dataCorruptedError(forKey: .lockDelaySeconds, in: values, debugDescription: "invalidLockDelay")
+        }
+    }
 }
 
 public struct MacTransfer: Identifiable, Sendable {
@@ -143,9 +157,15 @@ public final class MacRuntime {
     }
     public func lock(enabled: Bool, primary: UUID?) throws {
         let identity = configuration.peers.first(where: { $0.id == primary })?.identity
+        try locker.setDelay(seconds: configuration.lockDelaySeconds)
         try locker.configure(enabled: enabled, primary: identity)
         configuration.lockEnabled = enabled; configuration.primary = primary; persist()
         if let identity, connected.contains(identity) { locker.connected(identity) }
+    }
+    public func saveLockDelay(seconds: Int) throws {
+        try locker.setDelay(seconds: seconds)
+        configuration.lockDelaySeconds = seconds
+        persist()
     }
     public func requestLockAuthorization() -> Bool {
         let allowed = locker.requestAuthorization()
@@ -185,6 +205,7 @@ public final class MacRuntime {
     }
     private func persist() { UserDefaults.standard.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
     private func configureLock() {
+        try? locker.setDelay(seconds: configuration.lockDelaySeconds)
         try? locker.configure(enabled: configuration.lockEnabled,
                               primary: configuration.peers.first(where: { $0.id == configuration.primary })?.identity)
     }

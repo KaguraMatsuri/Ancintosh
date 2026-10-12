@@ -92,6 +92,58 @@ private let phoneID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
     #expect(!tick6)
 }
 
+@Test func configuredLockDelayKeepsActiveDeadlineAndAppliesOnNextLoss() throws {
+    var lock = LockStateMachine()
+    try lock.setDelay(seconds: 30)
+    lock.configure(enabled: true, primary: phoneID)
+    lock.connected(phoneID)
+    lock.disconnected(phoneID, intentional: false, now: .seconds(10))
+    #expect(lock.deadline == .seconds(40))
+    try lock.setDelay(seconds: 1)
+    #expect(lock.deadline == .seconds(40))
+    let early = lock.tick(now: .seconds(39))
+    #expect(!early)
+    lock.connected(phoneID)
+    #expect(lock.deadline == nil)
+    lock.disconnected(phoneID, intentional: false, now: .seconds(50))
+    #expect(lock.deadline == .seconds(51))
+    let due = lock.tick(now: .seconds(51))
+    #expect(due)
+    let repeated = lock.tick(now: .seconds(52))
+    #expect(!repeated)
+}
+
+@Test func longerDelayDoesNotPostponeAnAlreadyStartedCountdown() throws {
+    var lock = LockStateMachine()
+    try lock.setDelay(seconds: 1)
+    lock.configure(enabled: true, primary: phoneID)
+    lock.connected(phoneID)
+    lock.disconnected(phoneID, intentional: false, now: .zero)
+    try lock.setDelay(seconds: 3600)
+    #expect(lock.deadline == .seconds(1))
+    let due = lock.tick(now: .seconds(1))
+    #expect(due)
+    lock.connected(phoneID)
+    lock.disconnected(phoneID, intentional: false, now: .seconds(20))
+    #expect(lock.deadline == .seconds(3620))
+}
+
+@Test func invalidLockDelayDoesNotChangeSettingOrDeadline() throws {
+    var lock = LockStateMachine()
+    lock.configure(enabled: true, primary: phoneID)
+    lock.connected(phoneID)
+    lock.disconnected(phoneID, intentional: false, now: .zero)
+    for seconds in [-1, 0, 3601, Int.max] {
+        #expect(throws: LockConfigurationError.invalidDelay) { try lock.setDelay(seconds: seconds) }
+        #expect(lock.delaySeconds == 15)
+        #expect(lock.deadline == .seconds(15))
+    }
+    lock.stop()
+    #expect(lock.deadline == nil)
+    let stopped = lock.tick(now: .seconds(100))
+    #expect(!stopped)
+}
+
 @Test func wifiFallbackAndStableRecovery() throws {
     var route = TransportCoordinator()
     route.path(true, now: .zero)

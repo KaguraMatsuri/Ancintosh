@@ -32,12 +32,19 @@ public struct TransportCoordinator: Sendable {
     public mutating func tcpLost() { current = .ble; wifiAvailableSince = nil }
 }
 
+public enum LockConfigurationError: Error, Sendable { case invalidDelay }
+
 public struct LockStateMachine: Sendable {
     public private(set) var enabled = false
     public private(set) var primary: UUID?
     public private(set) var armed = false
     public private(set) var deadline: Duration?
+    public private(set) var delaySeconds = 15
     public init() {}
+    public mutating func setDelay(seconds: Int) throws {
+        guard (1...3600).contains(seconds) else { throw LockConfigurationError.invalidDelay }
+        delaySeconds = seconds
+    }
     public mutating func configure(enabled: Bool, primary: UUID?) {
         if self.primary != primary || !enabled { armed = false; deadline = nil }
         self.enabled = enabled
@@ -49,7 +56,7 @@ public struct LockStateMachine: Sendable {
     public mutating func disconnected(_ peer: UUID, intentional: Bool, now: Duration) {
         guard peer == primary else { return }
         if intentional { armed = false; deadline = nil }
-        else if enabled && armed && deadline == nil { deadline = now + .seconds(15) }
+        else if enabled && armed && deadline == nil { deadline = now + .seconds(delaySeconds) }
     }
     public mutating func tick(now: Duration) -> Bool {
         guard enabled, armed, let deadline, now >= deadline else { return false }

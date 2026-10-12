@@ -9,6 +9,8 @@ struct MainView: View {
     @State private var selected: UUID?
     @State private var error: String?
     @State private var busy = false
+    @State private var lockDelayDraft = ""
+    @State private var lockDelayError: String?
 
     var body: some View {
         Form {
@@ -81,7 +83,17 @@ struct MainView: View {
                     configureLock(enabled: enabled, primary: runtime.configuration.primary)
                 }))
                     .disabled(runtime.configuration.primary == nil)
-                Text("主 Android 连接并通过认证后生效；意外断连 15 秒后锁定，期间重连则取消。主动停止不会锁定。").foregroundStyle(.secondary)
+                TextField("锁定等待时间（秒）", text: $lockDelayDraft)
+                    .disabled(busy)
+                HStack {
+                    Button("保存") { saveLockDelay() }
+                        .disabled(busy || lockDelayDraft == String(runtime.configuration.lockDelaySeconds))
+                    Button("取消") { resetLockDelayDraft() }
+                        .disabled(busy || (lockDelayDraft == String(runtime.configuration.lockDelaySeconds) && lockDelayError == nil))
+                }
+                if let lockDelayError { Text(lockDelayError) }
+                Text("输入 1–3600 的整数秒，默认 15 秒。已开始的倒计时保持原值，新时间从下次断连生效。").foregroundStyle(.secondary)
+                Text("主 Android 连接并通过认证后生效；意外断连 \(runtime.configuration.lockDelaySeconds) 秒后锁定，期间重连则取消。主动停止不会锁定。").foregroundStyle(.secondary)
                 if !runtime.lockAllowed {
                     if runtime.lockAuthorizationRequested {
                         Button("打开系统设置") { openSystemSettings() }
@@ -103,12 +115,26 @@ struct MainView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { runtime.refreshPermissions() }
+        .onAppear { runtime.refreshPermissions(); resetLockDelayDraft() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in runtime.refreshPermissions() }
         .sheet(item: $editing) { profile in PeerEditor(profile: profile, runtime: runtime) }
         .alert("操作未完成", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("确定", role: .cancel) { error = nil }
         } message: { Text(error ?? "") }
+    }
+    private func resetLockDelayDraft() {
+        lockDelayDraft = String(runtime.configuration.lockDelaySeconds)
+        lockDelayError = nil
+    }
+    private func saveLockDelay() {
+        let value = lockDelayDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+              let seconds = Int(value), (1...3600).contains(seconds) else {
+            lockDelayError = "请输入 1–3600 的整数秒。"
+            return
+        }
+        do { try runtime.saveLockDelay(seconds: seconds); resetLockDelayDraft() }
+        catch { lockDelayError = "请输入 1–3600 的整数秒。" }
     }
     private func configureLock(enabled: Bool, primary: UUID?) {
         if enabled {
