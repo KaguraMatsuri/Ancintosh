@@ -9,8 +9,22 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
-    <application android:allowBackup="false" android:dataExtractionRules="@xml/data_extraction_rules" android:label="Andcintosh" android:supportsRtl="true">
+    <application android:allowBackup="false" android:dataExtractionRules="@xml/data_extraction_rules" android:label="@string/app_name" android:supportsRtl="true">
+        <activity android:name=".ui.MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+        <activity android:name=".ui.ShareReceiverActivity" android:exported="true" android:label="@string/sync">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
         <service android:name=".platform.SyncService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <service android:name=".platform.SyncTileService" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:label="@string/sync" android:icon="@android:drawable/stat_notify_sync">
+            <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+        </service>
         <provider android:name=".platform.ClipboardFileProvider" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>

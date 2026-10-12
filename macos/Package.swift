@@ -7,10 +7,12 @@ let package = Package(
     products: [
         .library(name: "AndcintoshCore", targets: ["AndcintoshCore"]),
         .library(name: "AndcintoshPlatform", targets: ["AndcintoshPlatform"]),
+        .executable(name: "Andcintosh", targets: ["AndcintoshApp"]),
     ],
     targets: [
         .target(name: "AndcintoshCore"),
         .target(name: "AndcintoshPlatform", dependencies: ["AndcintoshCore"]),
+        .executableTarget(name: "AndcintoshApp", dependencies: ["AndcintoshPlatform", "AndcintoshCore"]),
         .testTarget(name: "AndcintoshCoreTests", dependencies: ["AndcintoshCore"]),
     ]
 )

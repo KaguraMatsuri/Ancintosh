@@ -33,8 +33,10 @@ class FileAccess(private val context: Context, private val store: TransferStore,
         fail(Failure.unsupported)
     }
     fun snapshot(uri: Uri, kind: PayloadKind): Snapshot {
+        if (uri.scheme != "content") fail(Failure.originalUnavailable)
         val resolver = context.contentResolver
         val mime = resolver.getType(uri) ?: "application/octet-stream"
+        if (kind == PayloadKind.IMAGE && !mime.startsWith("image/")) fail(Failure.originalUnavailable)
         var name: String? = null
         resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
             if (it.moveToFirst()) name = it.getString(0)
@@ -46,7 +48,10 @@ class FileAccess(private val context: Context, private val store: TransferStore,
         }
         var original = uri
         if (uri.authority == MediaStore.AUTHORITY && mime.startsWith("image/")) {
-            if (context.checkSelfPermission(AndroidManifest.permission.ACCESS_MEDIA_LOCATION) != PackageManager.PERMISSION_GRANTED) fail(Failure.permissionDenied)
+            if (context.checkSelfPermission(AndroidManifest.permission.ACCESS_MEDIA_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                DeviceSettings(context).originalPermissionNeeded = true
+                fail(Failure.permissionDenied)
+            }
             original = MediaStore.setRequireOriginal(uri)
         }
         val input = resolver.openInputStream(original) ?: fail(Failure.originalUnavailable)

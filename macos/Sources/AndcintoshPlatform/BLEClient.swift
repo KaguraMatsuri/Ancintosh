@@ -23,6 +23,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     private var keys: [UUID: Data] = [:]
     private var identities: [UUID: UUID] = [:]
     private var stopped = false
+    private var scanPending = false
     private let identity: UUID
     private let coordinator: SyncCoordinator
 
@@ -32,16 +33,20 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         central = CBCentralManager(delegate: self, queue: .main)
     }
     public func scan() {
-        guard central.state == .poweredOn else { return }
         stopped = false
+        scanPending = true
+        guard central.state == .poweredOn else { return }
+        scanPending = false
         central.scanForPeripherals(withServices: [BLEIdentifiers.service], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         Task { [weak self] in try? await Task.sleep(for: .seconds(10)); self?.central.stopScan() }
     }
     public func connect(identifier: UUID, key: Data, expectedIdentity: UUID? = nil) throws {
-        guard key.count == 32, central.state == .poweredOn else { throw ProtocolFailure.peerUnavailable }
+        guard key.count == 32 else { throw ProtocolFailure.invalidKey }
         stopped = false
         keys[identifier] = key
         if let expectedIdentity { identities[identifier] = expectedIdentity }
+        if central.state == .unknown || central.state == .resetting { return }
+        guard central.state == .poweredOn else { throw central.state == .unauthorized ? ProtocolFailure.permissionDenied : .peerUnavailable }
         let peripheral = peripherals[identifier] ?? central.retrievePeripherals(withIdentifiers: [identifier]).first
         guard let peripheral else { throw ProtocolFailure.peerUnavailable }
         peripherals[identifier] = peripheral
@@ -51,12 +56,19 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     }
     public func stop() async {
         stopped = true
+        scanPending = false
         central.stopScan()
         await coordinator.stop()
         for peripheral in peripherals.values { central.cancelPeripheralConnection(peripheral) }
     }
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if central.state != .poweredOn {
+        if central.state == .poweredOn && !stopped {
+            if scanPending { scan() }
+            for (id, key) in keys {
+                do { try connect(identifier: id, key: key, expectedIdentity: identities[id]) }
+                catch { failed?(id, error as? ProtocolFailure ?? .peerUnavailable) }
+            }
+        } else if central.state != .poweredOn {
             for peer in identities.values { Task { await coordinator.disconnect(peer) } }
         }
     }

@@ -26,6 +26,10 @@ class DeviceSettings(context: Context) {
     var mac: UUID?
         get() = prefs.getString("mac", null)?.let(UUID::fromString)
         set(value) { prefs.edit().putString("mac", value?.toString()).commit() }
+    val hasKey: Boolean get() = prefs.contains("key") && prefs.contains("iv")
+    var originalPermissionNeeded: Boolean
+        get() = prefs.getBoolean("originalPermissionNeeded", false)
+        set(value) { prefs.edit().putBoolean("originalPermissionNeeded", value).apply() }
     fun saveKey(hex: String) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding"); cipher.init(Cipher.ENCRYPT_MODE, wrappingKey())
         val wrapped = cipher.doFinal(Crypto.key(hex))

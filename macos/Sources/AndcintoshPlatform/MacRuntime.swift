@@ -21,6 +21,15 @@ public struct MacConfiguration: Codable, Sendable {
     public init() {}
 }
 
+public struct MacTransfer: Identifiable, Sendable {
+    public let id: UUID
+    public let peer: UUID
+    public let name: String
+    public let size: UInt64
+    public var bytes: UInt64 = 0
+    public var failure: ProtocolFailure?
+}
+
 @MainActor @Observable
 public final class MacRuntime {
     public private(set) var configuration: MacConfiguration
@@ -29,10 +38,15 @@ public final class MacRuntime {
     public private(set) var progress: [UUID: (UInt64, UInt64)] = [:]
     public private(set) var failures: [UUID: ProtocolFailure] = [:]
     public private(set) var preparing = false
+    public private(set) var running = false
+    public private(set) var transfers: [UUID: MacTransfer] = [:]
+    public private(set) var clipboardAllowed = false
+    public private(set) var lockAllowed = false
     private let store: TransferStore
     private let pasteboard = PasteboardBridge()
     private let locker = LockController()
-    private let monitor = NWPathMonitor()
+    private var monitor: NWPathMonitor?
+    private var restored = false
     private var lan = false
     private var offers: [UUID: Task<Void, Never>] = [:]
     private var observation: [NSObjectProtocol] = []
@@ -63,12 +77,20 @@ public final class MacRuntime {
     }
 
     public func start() {
+        guard !running else { return }
+        running = true
+        refreshPermissions()
         _ = bluetooth
         configureLock()
         pasteboard.changed = { [weak self] file, text, mime in
             guard let self else { return }
-            Task { try? await self.clipboard(file: file, text: text, mime: mime, targets: self.connected) }
+            Task {
+                do { try await self.clipboard(file: file, text: text, mime: mime, targets: self.connected) }
+                catch { for peer in self.connected { self.failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable } }
+            }
         }
+        let monitor = NWPathMonitor()
+        self.monitor = monitor
         monitor.pathUpdateHandler = { [weak self] path in
             let available = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
             Task { @MainActor in await self?.pathChanged(available) }
@@ -81,11 +103,24 @@ public final class MacRuntime {
         observation.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { if self?.connected.isEmpty == false { self?.pasteboard.start() } }
         })
-        Task { try? await coordinator.restore() }
+        Task {
+            if !restored {
+                do {
+                    try await coordinator.restore(); restored = true
+                    for job in await coordinator.outgoingFiles() {
+                        transfers[job.manifest.id] = MacTransfer(id: job.manifest.id, peer: job.peer, name: job.manifest.name,
+                                                               size: job.manifest.size, bytes: job.offset, failure: job.failure)
+                    }
+                } catch { failures[configuration.identity] = error as? ProtocolFailure ?? .sourceUnavailable }
+            }
+            await coordinator.wifi(configuration.wifi && lan)
+        }
     }
-    public func scan() { bluetooth.scan() }
+    public func refreshPermissions() { clipboardAllowed = pasteboard.permitted; lockAllowed = locker.permitted }
+    public func scan() { start(); discovered.removeAll(); bluetooth.scan() }
     public func save(_ profile: PeerProfile, key: String) async throws {
-        let bytes = try Crypto.key(key)
+        let bytes = key.isEmpty ? try KeychainStore.load(peer: profile.id) : try Crypto.key(key)
+        start()
         if let existing = configuration.peers.first(where: { $0.id == profile.id }), let peer = existing.identity { await coordinator.stop(peer) }
         try KeychainStore.save(bytes, peer: profile.id)
         if let index = configuration.peers.firstIndex(where: { $0.id == profile.id }) { configuration.peers[index] = profile }
@@ -94,6 +129,9 @@ public final class MacRuntime {
         try bluetooth.connect(identifier: profile.id, key: bytes, expectedIdentity: profile.identity)
     }
     public func connect(_ profile: PeerProfile) throws {
+        start()
+        failures.removeValue(forKey: profile.id)
+        if let identity = profile.identity { failures.removeValue(forKey: identity) }
         try bluetooth.connect(identifier: profile.id, key: KeychainStore.load(peer: profile.id), expectedIdentity: profile.identity)
     }
     public func wifi(_ enabled: Bool) async {
@@ -120,14 +158,22 @@ public final class MacRuntime {
             guard values.isRegularFile == true else { throw ProtocolFailure.unsupported }
             let snapshot = try await store.snapshot(url, kind: .file, name: url.lastPathComponent,
                                                     mime: values.contentType?.preferredMIMEType ?? "application/octet-stream", origin: configuration.identity)
+            transfers[snapshot.manifest.id] = MacTransfer(id: snapshot.manifest.id, peer: peer, name: snapshot.manifest.name, size: snapshot.manifest.size)
             try await coordinator.enqueue(snapshot, targets: [peer], userInitiated: true)
         }
     }
-    public func cancel(_ id: UUID, peer: UUID) async { await coordinator.cancel(id, peer: peer) }
+    public func retry(_ id: UUID, peer: UUID) async throws {
+        transfers[id]?.failure = nil
+        try await coordinator.retry(id, peer: peer)
+    }
+    public func cancel(_ id: UUID, peer: UUID) async { await coordinator.cancel(id, peer: peer); transfers.removeValue(forKey: id) }
     public func stop() async {
-        locker.stop(); pasteboard.stop(); monitor.cancel()
+        let wasRunning = running
+        running = false
+        locker.stop(); pasteboard.stop(); monitor?.cancel(); monitor = nil; lan = false
         for task in offers.values { task.cancel() }; offers.removeAll()
-        await bluetooth.stop(); await server.stop()
+        if wasRunning { await bluetooth.stop() } else { await coordinator.stop() }
+        await server.stop()
         for token in observation { NSWorkspace.shared.notificationCenter.removeObserver(token) }; observation.removeAll()
         connected.removeAll()
     }
@@ -137,6 +183,7 @@ public final class MacRuntime {
                               primary: configuration.peers.first(where: { $0.id == configuration.primary })?.identity)
     }
     private func pathChanged(_ available: Bool) async {
+        guard running else { return }
         lan = available
         await coordinator.wifi(configuration.wifi && available)
         if configuration.wifi && available { for peer in connected { scheduleOffer(peer) } }
@@ -163,6 +210,7 @@ public final class MacRuntime {
     private func event(_ event: SyncEvent) async throws {
         switch event {
         case .connected(let peer):
+            failures.removeValue(forKey: peer)
             connected.insert(peer); locker.connected(peer); pasteboard.start()
             if pasteboard.permitted {
                 do { let value = try pasteboard.current(); try await clipboard(file: value.0, text: value.1, mime: value.2, targets: [peer]) }
@@ -174,8 +222,8 @@ public final class MacRuntime {
             offers.removeValue(forKey: peer)?.cancel()
             if connected.isEmpty { pasteboard.stop(); await server.stop() }
         case .received(_, let manifest, let url): if manifest.kind != .file { try pasteboard.apply(manifest, file: url) }
-        case .progress(_, let id, let bytes, let size): progress[id] = (bytes, size)
-        case .failed(let peer, _, let code): failures[peer] = code
+        case .progress(_, let id, let bytes, let size): progress[id] = (bytes, size); transfers[id]?.bytes = bytes
+        case .failed(let peer, let id, let code): failures[peer] = code; transfers[id]?.failure = code
         case .wifiChanged(let peer, let enabled):
             if enabled { scheduleOffer(peer) }
             else {
@@ -183,7 +231,7 @@ public final class MacRuntime {
                 for candidate in connected where await coordinator.permitsWifi(candidate) { eligible = true }
                 if !eligible { await server.stop() }
             }
-        case .completed(_, let id): progress.removeValue(forKey: id)
+        case .completed(_, let id): progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
         case .tcpOffer: break
         }
     }

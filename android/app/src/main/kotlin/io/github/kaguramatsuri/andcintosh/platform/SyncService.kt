@@ -3,63 +3,174 @@ package io.github.kaguramatsuri.andcintosh.platform
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
-import android.content.Intent
-import android.content.Context
-import android.content.BroadcastReceiver
-import android.content.IntentFilter
 import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
+import io.github.kaguramatsuri.andcintosh.R
 import io.github.kaguramatsuri.andcintosh.core.*
+import io.github.kaguramatsuri.andcintosh.ui.MainActivity
 import java.io.File
+import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
-import org.json.JSONObject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+data class FileTransfer(val id: UUID, val name: String, val size: Long, val bytes: Long = 0, val failure: Failure? = null)
+data class SyncStatus(val running: Boolean = true, val ready: Boolean = false, val peer: UUID? = null,
+                      val preparing: Boolean = false, val failure: Failure? = null, val transfers: List<FileTransfer> = emptyList())
 
 class SyncService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val preparation = Mutex()
+    private var startup: Job? = null
     private lateinit var peripheral: BLEPeripheral
     private lateinit var tcp: TCPClient
     lateinit var session: SessionController; private set
     lateinit var files: FileAccess; private set
+    private val mutableStatus = MutableStateFlow(SyncStatus())
+    val status = mutableStatus.asStateFlow()
     val events = MutableSharedFlow<SyncEvent>(extraBufferCapacity = 32)
     inner class LocalBinder : Binder() { val service get() = this@SyncService }
     private val binder = LocalBinder()
     private val radio = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (!::peripheral.isInitialized) return
-            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
-                BluetoothAdapter.STATE_OFF -> scope.launch { session.disconnect(); peripheral.stop() }
-                BluetoothAdapter.STATE_ON -> scope.launch { runCatching { peripheral.start() } }
+            if (!::peripheral.isInitialized || !status.value.running) return
+            scope.launch {
+                if (!status.value.running) return@launch
+                try {
+                    when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                        BluetoothAdapter.STATE_OFF -> { session.disconnect(); peripheral.stop() }
+                        BluetoothAdapter.STATE_ON -> peripheral.start()
+                    }
+                } catch (error: Exception) { report(error) }
             }
         }
     }
     override fun onCreate() {
         super.onCreate()
-        val copy = JSONObject(assets.open("copy.json").bufferedReader().use { it.readText() })
-        val channel = NotificationChannel("andcintosh.connection", copy.getString("notification_channel"), NotificationManager.IMPORTANCE_LOW)
-        channel.setSound(null, null)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        startForeground(1, Notification.Builder(this, channel.id).setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("Andcintosh").setContentText(copy.getString("notification_body")).setOngoing(true).build())
+        foregroundNotification()
         val settings = DeviceSettings(this)
         val store = TransferStore(File(filesDir, "state")) { file, manifest -> FileAccess.publish(this, file, manifest) }
         files = FileAccess(this, store, settings.identity)
         session = SessionController(settings.identity, scope, store) { event ->
             if (event is SyncEvent.Delivered) files.apply(event.result)
             if (event is SyncEvent.Offer) scope.launch { tcp.connect(event) }
-            events.tryEmit(event)
+            mutableStatus.update { current ->
+                when (event) {
+                    is SyncEvent.Connected -> current.copy(peer = event.peer, failure = null)
+                    is SyncEvent.Disconnected -> current.copy(peer = null)
+                    is SyncEvent.Progress -> current.copy(transfers = current.transfers.map { if (it.id == event.id) it.copy(bytes = event.offset) else it })
+                    is SyncEvent.Failed -> current.copy(failure = event.code, transfers = current.transfers.map { if (it.id == event.id) it.copy(failure = event.code) else it })
+                    is SyncEvent.Completed -> current.copy(transfers = current.transfers.filterNot { it.id == event.id })
+                    else -> current
+                }
+            }
+            events.emit(event)
         }
         tcp = TCPClient(this, scope, session)
-        peripheral = BLEPeripheral(this, scope, settings, session) { events.tryEmit(SyncEvent.Failed(Wire.ZERO_ID, it)) }
-        tcp.start()
+        peripheral = BLEPeripheral(this, scope, settings, session) { code ->
+            mutableStatus.update { it.copy(failure = code) }
+            events.tryEmit(SyncEvent.Failed(Wire.ZERO_ID, code))
+        }
         registerReceiver(radio, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), Context.RECEIVER_EXPORTED)
-        scope.launch { session.restore(); session.wifi(settings.wifi); peripheral.start() }
+        startup = scope.launch {
+            try {
+                session.restore()
+                val restored = session.outgoingFiles().map { FileTransfer(it.snapshot.manifest.id, it.snapshot.manifest.name, it.snapshot.manifest.size, it.offset, it.failed) }
+                mutableStatus.update { it.copy(transfers = restored) }
+                startRadio()
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { report(error) }
+        }
     }
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+    private fun foregroundNotification() {
+        val channel = NotificationChannel("andcintosh.connection", getString(R.string.notification_channel), NotificationManager.IMPORTANCE_LOW)
+        channel.setSound(null, null)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val content = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        startForeground(1, Notification.Builder(this, channel.id).setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle(getString(R.string.app_name)).setContentText(getString(R.string.notification_body))
+            .setContentIntent(content).setOngoing(true).setOnlyAlertOnce(true).build())
+    }
+    private suspend fun startRadio() {
+        session.wifi(DeviceSettings(this).wifi); tcp.start(); peripheral.start()
+        mutableStatus.update { it.copy(running = true, ready = true, failure = null) }
+    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!status.value.running) {
+            foregroundNotification()
+            mutableStatus.update { it.copy(running = true, ready = false) }
+            startup = scope.launch {
+                try { startRadio() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) { report(error) }
+            }
+        }
+        return START_NOT_STICKY
+    }
     override fun onBind(intent: Intent?): IBinder = binder
-    suspend fun stopSync() { session.disconnect(true); stopSelf() }
+    suspend fun saveKey(hex: String) {
+        Crypto.key(hex)
+        session.disconnect(true); peripheral.stop()
+        DeviceSettings(this).saveKey(hex)
+        peripheral.start()
+        mutableStatus.update { it.copy(ready = true, failure = null) }
+    }
+    suspend fun wifi(enabled: Boolean) { DeviceSettings(this).wifi = enabled; session.wifi(enabled) }
+    suspend fun enqueue(snapshot: Snapshot) {
+        if (!status.value.ready) fail(Failure.peerUnavailable)
+        session.enqueue(snapshot)
+    }
+    fun sendFiles(uris: List<Uri>) {
+        scope.launch {
+            preparation.withLock {
+                mutableStatus.update { it.copy(preparing = true, failure = null) }
+                try {
+                    if (!status.value.ready || session.connected == null) fail(Failure.peerUnavailable)
+                    for (uri in uris) {
+                        val snapshot = files.snapshot(uri, PayloadKind.FILE)
+                        val row = FileTransfer(snapshot.manifest.id, snapshot.manifest.name, snapshot.manifest.size)
+                        mutableStatus.update { it.copy(transfers = it.transfers + row) }
+                        try { session.enqueue(snapshot) }
+                        catch (error: Exception) {
+                            mutableStatus.update { it.copy(transfers = it.transfers.filterNot { row -> row.id == snapshot.manifest.id }) }
+                            snapshot.file.delete(); throw error
+                        }
+                    }
+                } catch (error: Exception) { report(error) }
+                finally { mutableStatus.update { it.copy(preparing = false) } }
+            }
+        }
+    }
+    suspend fun retry(id: UUID) {
+        mutableStatus.update { it.copy(failure = null, transfers = it.transfers.map { row -> if (row.id == id) row.copy(failure = null) else row }) }
+        session.retry(id)
+    }
+    suspend fun cancel(id: UUID) {
+        session.cancel(id)
+        mutableStatus.update { it.copy(transfers = it.transfers.filterNot { row -> row.id == id }) }
+    }
+    fun cancelAsync(id: UUID) { scope.launch { runCatching { cancel(id) } } }
+    suspend fun stopSync() {
+        startup?.cancelAndJoin()
+        mutableStatus.update { it.copy(running = false, ready = false) }
+        session.disconnect(true); peripheral.stop(); tcp.stop()
+        stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+    }
+    private fun report(error: Exception) {
+        mutableStatus.update { it.copy(failure = (error as? ProtocolException)?.code ?: if (error is SecurityException) Failure.permissionDenied else Failure.sourceUnavailable) }
+    }
     override fun onDestroy() {
         if (::peripheral.isInitialized) peripheral.stop()
         if (::tcp.isInitialized) tcp.stop()
