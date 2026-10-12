@@ -6,6 +6,7 @@
     <key>CFBundleExecutable</key><string>Andcintosh</string>
     <key>CFBundleIdentifier</key><string>io.github.kaguramatsuri.Andcintosh</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>Andcintosh.icns</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
