@@ -24,6 +24,7 @@ private struct LegacyConfiguration: Codable {
     #expect(restored.primary == device)
     #expect(restored.lockEnabled)
     #expect(!restored.wifi)
+    #expect(restored.name == MacConfiguration.systemName)
 }
 
 @Test func configuredMacDelayRoundTripsAndRejectsInvalidStoredValues() throws {

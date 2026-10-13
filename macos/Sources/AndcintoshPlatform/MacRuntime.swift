@@ -3,6 +3,7 @@ import AppKit
 import Foundation
 import Network
 import Observation
+import SystemConfiguration
 import UniformTypeIdentifiers
 
 public struct PeerProfile: Codable, Sendable, Identifiable {
@@ -29,9 +30,10 @@ public struct MacConfiguration: Codable, Sendable {
     public var wifi = true
     public var lockDelaySeconds = 15
     public var nodePositions: [String: NodePosition] = [:]
-    public var name = "Mac"
+    public var name = MacConfiguration.systemName
     public var revision: Int64 = 0
     public init() {}
+    public static var systemName: String { SCDynamicStoreCopyComputerName(nil, nil) as String? ?? ProcessInfo.processInfo.hostName }
     private enum CodingKeys: String, CodingKey { case identity, peers, primary, lockEnabled, wifi, lockDelaySeconds, nodePositions, name, revision }
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -42,7 +44,7 @@ public struct MacConfiguration: Codable, Sendable {
         wifi = try values.decode(Bool.self, forKey: .wifi)
         lockDelaySeconds = try values.decodeIfPresent(Int.self, forKey: .lockDelaySeconds) ?? 15
         nodePositions = try values.decodeIfPresent([String: NodePosition].self, forKey: .nodePositions) ?? [:]
-        name = try values.decodeIfPresent(String.self, forKey: .name) ?? "Mac"
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? Self.systemName
         revision = try values.decodeIfPresent(Int64.self, forKey: .revision) ?? 0
         guard (1...3600).contains(lockDelaySeconds), revision >= 0 else {
             throw DecodingError.dataCorruptedError(forKey: .lockDelaySeconds, in: values, debugDescription: "invalidLockDelay")
@@ -188,8 +190,8 @@ public final class MacRuntime {
         configurationChanged()
     }
     public func renameMac(_ name: String) throws {
-        try validateName(name.isEmpty ? "Mac" : name, mac: true)
-        configuration.name = name.isEmpty ? "Mac" : name
+        try validateName(name.isEmpty ? MacConfiguration.systemName : name, mac: true)
+        configuration.name = name.isEmpty ? MacConfiguration.systemName : name
         configurationChanged(devices: [])
     }
     public func renamePeer(_ id: UUID, name: String) throws {

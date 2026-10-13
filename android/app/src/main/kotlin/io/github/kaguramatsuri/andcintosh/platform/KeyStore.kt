@@ -1,6 +1,10 @@
 package io.github.kaguramatsuri.andcintosh.platform
 
 import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
+import android.bluetooth.BluetoothManager
+import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -24,7 +28,19 @@ import javax.crypto.spec.GCMParameterSpec
 class DeviceSettings(context: Context) {
     companion object { private val configurationLock = Any() }
     private val prefs = context.getSharedPreferences("andcintosh", Context.MODE_PRIVATE)
-    val name: String get() = prefs.getString("pendingName", null) ?: prefs.getString("name", null) ?: Build.MODEL
+    private val application = context.applicationContext
+    private val systemName: String get() {
+        val configured = try { Settings.Global.getString(application.contentResolver, Settings.Global.DEVICE_NAME)?.takeIf { it.isNotBlank() } }
+            catch (_: SecurityException) { null }
+        if (configured != null) return configured
+        if (application.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            val bluetooth = try { application.getSystemService(BluetoothManager::class.java)?.adapter?.name }
+                catch (_: SecurityException) { null }
+            if (!bluetooth.isNullOrBlank()) return bluetooth
+        }
+        return Build.MODEL
+    }
+    val name: String get() = prefs.getString("pendingName", null) ?: prefs.getString("name", null) ?: systemName
     val renameRequest: UUID? get() = prefs.getString("renameRequest", null)?.let(UUID::fromString)
     val macName: String? get() = prefs.getString("macName", null)
     fun information(kind: DeviceKind): DeviceInformation = synchronized(configurationLock) {
@@ -37,7 +53,7 @@ class DeviceSettings(context: Context) {
     // Check the durable commit result before sending the request over BLE.
     @android.annotation.SuppressLint("UseKtx")
     fun rename(name: String): Unit = synchronized(configurationLock) {
-        val candidate = name.ifEmpty { Build.MODEL }
+        val candidate = name.ifEmpty { systemName }
         // Use the existing frame bound before creating a durable request.
         Record(RecordKind.DEVICE_INFORMATION, metadata = DeviceInformation(candidate,
             DeviceKind.phone, wifi, UUID.randomUUID()).json().toString().toByteArray()).encode()
