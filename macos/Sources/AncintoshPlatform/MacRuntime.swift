@@ -76,7 +76,8 @@ public final class MacRuntime {
     public private(set) var routes: [UUID: TransportKind] = [:]
     public private(set) var switching: Set<UUID> = []
     public private(set) var activities: [UUID: [LinkActivity]] = [:]
-    public let packetTraffic = ConnectionTraffic()
+    public let packetTraffic: ConnectionTraffic
+    public let isDemonstration: Bool
     public private(set) var progress: [UUID: (UInt64, UInt64)] = [:]
     public private(set) var failures: [UUID: ProtocolFailure] = [:]
     public private(set) var preparing = false
@@ -85,9 +86,10 @@ public final class MacRuntime {
     public private(set) var clipboardAllowed = false
     public private(set) var lockAllowed = false
     public private(set) var lockAuthorizationRequested = false
-    private let preferences: UserDefaults
+    private let preferences: UserDefaults?
+    private let temporaryRoot: URL?
     private let store: TransferStore
-    private let pasteboard = PasteboardBridge()
+    @ObservationIgnored private lazy var pasteboard = PasteboardBridge()
     private let locker = LockController()
     private var monitor: NWPathMonitor?
     private var restored = false
@@ -130,6 +132,7 @@ public final class MacRuntime {
 
     public init(preferences: UserDefaults = .standard, root: URL? = nil, downloads: URL? = nil) throws {
         self.preferences = preferences
+        isDemonstration = false; temporaryRoot = nil; packetTraffic = ConnectionTraffic()
         if let data = preferences.data(forKey: "Andcintosh.configuration") {
             configuration = try Wire.decodeJSON(MacConfiguration.self, data)
         } else { configuration = MacConfiguration() }
@@ -139,7 +142,25 @@ public final class MacRuntime {
         store = try TransferStore(root: dataRoot, downloads: outputRoot)
     }
 
+    public init(demonstration configuration: MacConfiguration, traffic: ConnectionTraffic) throws {
+        self.configuration = configuration
+        preferences = nil; isDemonstration = true; packetTraffic = traffic
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Ancintosh-demo-\(UUID().uuidString)", isDirectory: true)
+        temporaryRoot = root
+        do { store = try TransferStore(root: root, downloads: root.appendingPathComponent("downloads")) }
+        catch { try? FileManager.default.removeItem(at: root); throw error }
+    }
+    deinit { if let temporaryRoot { try? FileManager.default.removeItem(at: temporaryRoot) } }
+
+    public func updateDemonstration(configuration: MacConfiguration, connected: Set<UUID>, routes: [UUID: TransportKind],
+                                    activities: [UUID: [LinkActivity]], running: Bool) {
+        guard isDemonstration else { return }
+        self.configuration = configuration; self.connected = connected; self.routes = routes
+        self.activities = activities; self.running = running
+    }
+
     public func start() {
+        guard !isDemonstration else { return }
         guard !running else { return }
         running = true
         refreshPermissions()
@@ -190,11 +211,13 @@ public final class MacRuntime {
         configurationChanged()
     }
     public func renameMac(_ name: String) throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         try validateName(name.isEmpty ? MacConfiguration.systemName : name, mac: true)
         configuration.name = name.isEmpty ? MacConfiguration.systemName : name
         configurationChanged(devices: [])
     }
     public func renamePeer(_ id: UUID, name: String) throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         guard let index = configuration.peers.firstIndex(where: { $0.id == id }) else { throw ProtocolFailure.peerUnavailable }
         try validateName(name, mac: false, profile: configuration.peers[index])
         configuration.peers[index].name = name.isEmpty ? nil : name
@@ -244,9 +267,13 @@ public final class MacRuntime {
         }
         if changed { persist() }
     }
-    public func refreshPermissions() { clipboardAllowed = pasteboard.permitted; lockAllowed = locker.permitted }
-    public func scan() { start(); discovered.removeAll(); bluetooth.scan() }
+    public func refreshPermissions() {
+        guard !isDemonstration else { return }
+        clipboardAllowed = pasteboard.permitted; lockAllowed = locker.permitted
+    }
+    public func scan() { guard !isDemonstration else { return }; start(); discovered.removeAll(); bluetooth.scan() }
     public func save(_ profile: PeerProfile, key: String) async throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         let bytes = key.isEmpty ? try KeychainStore.load(peer: profile.id) : try Crypto.key(key)
         start()
         if let existing = configuration.peers.first(where: { $0.id == profile.id }), let peer = existing.identity { await coordinator.stop(peer) }
@@ -262,18 +289,21 @@ public final class MacRuntime {
         try bluetooth.connect(identifier: profile.id, key: bytes, expectedIdentity: profile.identity)
     }
     public func connect(_ profile: PeerProfile) throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         start()
         failures.removeValue(forKey: profile.id)
         if let identity = profile.identity { failures.removeValue(forKey: identity) }
         try bluetooth.connect(identifier: profile.id, key: KeychainStore.load(peer: profile.id), expectedIdentity: profile.identity)
     }
     public func wifi(_ enabled: Bool) async {
+        guard !isDemonstration else { return }
         configuration.wifi = enabled; configurationChanged(devices: [])
         await coordinator.wifi(enabled && lan)
         if enabled && lan { for peer in connected { scheduleOffer(peer) } }
         else { for task in offers.values { task.cancel() }; offers.removeAll(); await server.stop() }
     }
     public func lock(enabled: Bool, primary: UUID?) throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         let identity = configuration.peers.first(where: { $0.id == primary })?.identity
         try locker.setDelay(seconds: configuration.lockDelaySeconds)
         try locker.configure(enabled: enabled, primary: identity)
@@ -281,17 +311,20 @@ public final class MacRuntime {
         if let identity, connected.contains(identity) { locker.connected(identity) }
     }
     public func saveLockDelay(seconds: Int) throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         try locker.setDelay(seconds: seconds)
         configuration.lockDelaySeconds = seconds
         configurationChanged(devices: [])
     }
     public func requestLockAuthorization() -> Bool {
+        guard !isDemonstration else { return false }
         let allowed = locker.requestAuthorization()
         lockAuthorizationRequested = locker.authorizationRequested
         refreshPermissions()
         return allowed
     }
     public func files(_ urls: [URL], peer: UUID) async throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         guard connected.contains(peer) else { throw ProtocolFailure.peerUnavailable }
         preparing = true
         defer { preparing = false }
@@ -307,11 +340,20 @@ public final class MacRuntime {
         }
     }
     public func retry(_ id: UUID, peer: UUID) async throws {
+        guard !isDemonstration else { throw ProtocolFailure.unsupported }
         transfers[id]?.failure = nil
         try await coordinator.retry(id, peer: peer)
     }
-    public func cancel(_ id: UUID, peer: UUID) async { await coordinator.cancel(id, peer: peer); transfers.removeValue(forKey: id) }
+    public func cancel(_ id: UUID, peer: UUID) async {
+        guard !isDemonstration else { return }
+        await coordinator.cancel(id, peer: peer); transfers.removeValue(forKey: id)
+    }
     public func stop() async {
+        if isDemonstration {
+            running = false; packetTraffic.stop(); connected.removeAll(); routes.removeAll(); activities.removeAll()
+            if let temporaryRoot { try? FileManager.default.removeItem(at: temporaryRoot) }
+            return
+        }
         let wasRunning = running
         running = false
         packetTraffic.stop()
@@ -329,6 +371,7 @@ public final class MacRuntime {
     }
     private func configurationChanged(devices: Set<UUID>? = nil) {
         if configuration.revision < Int64.max { configuration.revision += 1 }
+        guard !isDemonstration else { return }
         persist(); synchronizeConfiguration(devices: devices)
     }
     private func synchronizeConfiguration(targets: Set<UUID>? = nil, devices: Set<UUID>? = nil) {
@@ -375,7 +418,7 @@ public final class MacRuntime {
         if case .packet(_, false) = event, profile.identity.map({ connected.contains($0) }) != true { return }
         packetTraffic.signal(profile.id, event)
     }
-    private func persist() { preferences.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
+    private func persist() { preferences?.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
     private func configureLock() {
         try? locker.setDelay(seconds: configuration.lockDelaySeconds)
         try? locker.configure(enabled: configuration.lockEnabled,

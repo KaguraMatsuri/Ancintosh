@@ -5,6 +5,7 @@ import SwiftUI
 
 struct MainView: View {
     @Bindable var runtime: MacRuntime
+    var demo: TopologyDemo? = nil
     @State private var dividerReady = false
     @State private var editing: PeerProfile?
     @State private var editingMac = false
@@ -18,7 +19,7 @@ struct MainView: View {
 
     var body: some View {
         HSplitView {
-            settings.frame(minWidth: dividerReady ? 280 : 320, idealWidth: 320,
+            settings.disabled(demo != nil).frame(minWidth: dividerReady ? 280 : 320, idealWidth: 320,
                 maxWidth: dividerReady ? 420 : 320, maxHeight: .infinity)
             GeometryReader { geometry in
                 ScrollView {
@@ -157,7 +158,7 @@ struct MainView: View {
 
     private var topology: some View {
         ConnectionTopologyView(macName: runtime.configuration.name,
-            devices: runtime.configuration.peers.enumerated().map { index, profile in
+            devices: demo?.devices ?? runtime.configuration.peers.enumerated().map { index, profile in
                 let peer = profile.identity
                 return TopologyDevice(profile: profile, priority: index + 1,
                     connected: peer.map { runtime.connected.contains($0) } == true,
@@ -165,15 +166,19 @@ struct MainView: View {
                     activities: peer.flatMap { runtime.activities[$0] } ?? [], position: runtime.configuration.nodePositions[profile.id.uuidString],
                     signalSending: runtime.packetTraffic.sending.contains(profile.id), signalReceiving: runtime.packetTraffic.receiving.contains(profile.id),
                     communicating: runtime.packetTraffic.visible.contains(profile.id))
-            }, busy: busy, editMac: { macNameDraft = runtime.configuration.name; macNameError = nil; editingMac = true },
+            }, busy: busy, connectionManagementEnabled: demo == nil,
+            editMac: { macNameDraft = runtime.configuration.name; macNameError = nil; editingMac = true },
             connect: { id in
                 guard let profile = runtime.configuration.peers.first(where: { $0.id == id }) else { return }
                 do { try runtime.connect(profile) } catch { self.error = Copy.failure(error) }
             }, edit: { id in editing = runtime.configuration.peers.first(where: { $0.id == id }) },
-            move: movePeer, place: runtime.placeNodes)
+            move: movePeer, place: { positions in
+                if let demo { demo.place(positions) } else { runtime.placeNodes(positions) }
+            })
     }
 
     private func movePeer(_ id: UUID, down: Bool) {
+        if let demo { demo.move(id, down: down); return }
         guard !busy, let index = runtime.configuration.peers.firstIndex(where: { $0.id == id }),
               down ? index + 1 < runtime.configuration.peers.count : index > 0 else { return }
         runtime.movePeers(from: IndexSet(integer: index), to: down ? index + 2 : index - 1)

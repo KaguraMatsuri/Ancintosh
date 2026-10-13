@@ -13,6 +13,7 @@ struct TopologyDevice: Identifiable {
     var signalSending = false
     var signalReceiving = false
     var communicating = false
+    var handshaking = false
     var id: UUID { profile.id }
 }
 
@@ -20,6 +21,7 @@ struct ConnectionTopologyView: View {
     let macName: String
     let devices: [TopologyDevice]
     let busy: Bool
+    var connectionManagementEnabled = true
     let editMac: () -> Void
     let connect: (UUID) -> Void
     let edit: (UUID) -> Void
@@ -82,7 +84,7 @@ struct ConnectionTopologyView: View {
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary.opacity(0.4)))
                 .overlay(alignment: .topTrailing) {
                     Menu { Button("编辑", action: editMac) } label: { Image(systemName: "ellipsis") }
-                        .menuStyle(.borderlessButton).fixedSize().padding(8).disabled(busy).accessibilityLabel("编辑")
+                        .menuStyle(.borderlessButton).fixedSize().padding(8).disabled(busy || !connectionManagementEnabled).accessibilityLabel("编辑")
                 }
                 .position(mac)
             }
@@ -114,9 +116,10 @@ struct ConnectionTopologyView: View {
             }
             VStack(spacing: 5) {
                 ForEach([true, false], id: \.self) { sending in
-                    let active = device.connected && device.activities.contains { $0.sending == sending }
+                    let active = (device.connected && device.activities.contains { $0.sending == sending }) ||
+                        (device.handshaking && (sending ? device.signalSending : device.signalReceiving))
                     let clipboard = sending && device.activities.contains { $0.sending && $0.kind != .file }
-                    Text(clipboard ? "发送粘贴板中" : "数据传输中")
+                    Text(device.handshaking ? "握手包" : (clipboard ? "发送粘贴板中" : "数据传输中"))
                         .font(.caption).lineLimit(1)
                         .opacity(active ? 1 : 0)
                         .accessibilityHidden(!active)
@@ -154,8 +157,8 @@ struct ConnectionTopologyView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(device.connected ? Color.secondary.opacity(0.4) : .red, lineWidth: device.connected ? 1 : 2))
         .overlay(alignment: .topTrailing) {
             Menu {
-                Button("连接") { connect(device.id) }
-                Button("编辑") { edit(device.id) }
+                Button("连接") { connect(device.id) }.disabled(!connectionManagementEnabled)
+                Button("编辑") { edit(device.id) }.disabled(!connectionManagementEnabled)
                 Divider()
                 Button("上移") { move(device.id, false) }.disabled(device.priority == 1)
                 Button("下移") { move(device.id, true) }.disabled(device.priority == devices.count)

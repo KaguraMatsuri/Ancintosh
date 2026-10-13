@@ -21,21 +21,29 @@ struct AncintoshApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var runtime: MacRuntime?
     @State private var startupError: String?
+    @State private var demo: TopologyDemo?
+    private let demoMode: Bool
     init() {
-        do { _runtime = State(initialValue: try MacRuntime()) }
-        catch { _startupError = State(initialValue: Copy.failure(error)) }
+        demoMode = ProcessInfo.processInfo.arguments.contains("--demo-topology")
+        do {
+            if demoMode {
+                let seed = try TopologyDemo()
+                _demo = State(initialValue: seed); _runtime = State(initialValue: seed.runtime)
+            } else { _runtime = State(initialValue: try MacRuntime()) }
+        } catch { _startupError = State(initialValue: Copy.failure(error)) }
     }
     var body: some Scene {
         Window("Ancintosh", id: "main") {
             Group {
-                if let runtime { MainView(runtime: runtime) }
+                if let demo { TopologyDemoView(demo: demo) }
+                else if let runtime { MainView(runtime: runtime) }
                 else { ContentUnavailableView("无法启动", systemImage: "exclamationmark.triangle", description: Text(startupError ?? "请重新打开应用。")) }
             }
             .onAppear { delegate.runtime = runtime }
         }
         .defaultSize(width: 1100, height: 760)
         MenuBarExtra("Ancintosh", systemImage: "arrow.triangle.2.circlepath") {
-            RuntimeMenu(runtime: runtime)
+            RuntimeMenu(runtime: demoMode ? nil : runtime)
         }
     }
 }
