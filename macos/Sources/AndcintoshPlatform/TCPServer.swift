@@ -39,6 +39,10 @@ public actor TCPByteChannel: ByteChannel {
 
 public actor TCPServer {
     private var listeners: [NWListener] = []
+    private var ready = false
+    private var startupWaiters: [CheckedContinuation<[TCPAddress], any Error>] = []
+    private var startupTimeout: Task<Void, Never>?
+
     private let identity: UUID
     private let coordinator: SyncCoordinator
     private let queue = DispatchQueue(label: "Andcintosh.listener", qos: .utility)
@@ -46,29 +50,52 @@ public actor TCPServer {
     public init(identity: UUID, coordinator: SyncCoordinator) { self.identity = identity; self.coordinator = coordinator }
 
     public func start() async throws -> [TCPAddress] {
-        if !listeners.isEmpty { return addresses() }
-        for type in [NWInterface.InterfaceType.wifi, .wiredEthernet] {
-            let tcp = NWProtocolTCP.Options()
-            tcp.noDelay = true
-            tcp.connectionTimeout = 5
-            let parameters = NWParameters(tls: nil, tcp: tcp)
-            parameters.requiredInterfaceType = type
-            let listener = try NWListener(using: parameters, on: .any)
-            listener.newConnectionHandler = { [weak self] connection in
-                Task { await self?.accept(connection) }
+        if ready { return addresses() }
+        if listeners.isEmpty {
+            for type in [NWInterface.InterfaceType.wifi, .wiredEthernet] {
+                let tcp = NWProtocolTCP.Options()
+                tcp.noDelay = true
+                tcp.connectionTimeout = 5
+                let parameters = NWParameters(tls: nil, tcp: tcp)
+                parameters.requiredInterfaceType = type
+                let listener = try NWListener(using: parameters, on: .any)
+                listener.newConnectionHandler = { [weak self] connection in Task { await self?.accept(connection) } }
+                listener.stateUpdateHandler = { [weak self, weak listener] state in
+                    guard let listener else { return }
+                    Task { await self?.listenerChanged(listener, state: state) }
+                }
+                listeners.append(listener)
+                listener.start(queue: queue)
             }
-            listeners.append(listener)
-            listener.start(queue: queue)
+            startupTimeout = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                await self?.stop()
+            }
         }
-        for _ in 0..<50 {
-            if !addresses().isEmpty { return addresses() }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        stop()
-        throw ProtocolFailure.peerUnavailable
+        return try await withCheckedThrowingContinuation { startupWaiters.append($0) }
     }
 
+    private func listenerChanged(_ listener: NWListener, state: NWListener.State) {
+        guard listeners.contains(where: { $0 === listener }) else { return }
+        switch state {
+        case .ready:
+            let endpoints = addresses()
+            guard !endpoints.isEmpty else { return }
+            ready = true
+            startupTimeout?.cancel(); startupTimeout = nil
+            let pending = startupWaiters; startupWaiters.removeAll()
+            for waiter in pending { waiter.resume(returning: endpoints) }
+        case .failed:
+            listener.cancel(); listeners.removeAll { $0 === listener }
+            if listeners.isEmpty { stop() }
+        default: break
+        }
+    }
     public func stop() {
+        ready = false
+        startupTimeout?.cancel(); startupTimeout = nil
+        let pending = startupWaiters; startupWaiters.removeAll()
+        for waiter in pending { waiter.resume(throwing: ProtocolFailure.peerUnavailable) }
         for listener in listeners { listener.cancel() }
         listeners.removeAll()
     }

@@ -88,8 +88,12 @@ public struct TransferScheduler: Sendable {
     private var files: [OutboundJob] = []
     public init() {}
     public var jobs: [OutboundJob] { clipboard + files }
-    public func ready(available: Set<UUID>) -> Bool {
+    public func firstFilePeer(available: Set<UUID>) -> UUID? {
+        files.first(where: { available.contains($0.peer) && $0.failure == nil })?.peer
+    }
+    public func ready(available: Set<UUID>, includeFiles: Bool = true) -> Bool {
         if clipboard.contains(where: { available.contains($0.peer) && !$0.finished && !$0.waitingForResume && $0.failure == nil }) { return true }
+        guard includeFiles else { return false }
         if let file = files.first(where: { available.contains($0.peer) && $0.failure == nil }) { return !file.finished && !file.waitingForResume }
         return false
     }
@@ -100,8 +104,9 @@ public struct TransferScheduler: Sendable {
             if job.userInitiated { clipboard.insert(job, at: 0) } else { clipboard.append(job) }
         }
     }
-    public mutating func next(available: Set<UUID>) -> OutboundJob? {
+    public mutating func next(available: Set<UUID>, includeFiles: Bool = true) -> OutboundJob? {
         if let index = clipboard.firstIndex(where: { available.contains($0.peer) && !$0.finished && !$0.waitingForResume && $0.failure == nil }) { return clipboard.remove(at: index) }
+        guard includeFiles else { return nil }
         if let index = files.firstIndex(where: { available.contains($0.peer) && $0.failure == nil }) {
             if !files[index].finished && !files[index].waitingForResume { return files.remove(at: index) }
         }

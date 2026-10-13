@@ -116,7 +116,7 @@ class CoreTests {
         route.preference(remote=true); route.path(true,10000); assertFalse(route.shouldUpgrade(14999)); assertTrue(route.shouldUpgrade(15000))
         route.path(false,15001); assertFalse(route.shouldUpgrade(20000))
     }
-    @Test fun originalByteResumeAndDuplicateDelivery() {
+    @Test fun originalByteResumeAndDuplicateDelivery() = runBlocking {
         val root = Files.createTempDirectory("andcintosh-test").toFile()
         try {
             val downloads=File(root,"downloads").apply { mkdirs() }
@@ -135,7 +135,7 @@ class CoreTests {
             store.delivered(phone,source.manifest.id);assertFalse(store.finish(phone,source.manifest.id).fresh)
         } finally { root.deleteRecursively() }
     }
-    @Test fun badOffsetsPathsAndDigestCannotPublish() {
+    @Test fun badOffsetsPathsAndDigestCannotPublish() = runBlocking {
         assertFailsWith<ProtocolException> { Manifest(UUID.randomUUID(),PayloadKind.FILE,"../escape","x",0,Crypto.digest(byteArrayOf()),mac) }
         val root=Files.createTempDirectory("andcintosh-test").toFile()
         try {

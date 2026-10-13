@@ -49,6 +49,8 @@ public final class MacRuntime {
     public private(set) var configuration: MacConfiguration
     public private(set) var discovered: [UUID: BLEPeer] = [:]
     public private(set) var connected: Set<UUID> = []
+    public private(set) var routes: [UUID: TransportKind] = [:]
+    public private(set) var switching: Set<UUID> = []
     public private(set) var progress: [UUID: (UInt64, UInt64)] = [:]
     public private(set) var failures: [UUID: ProtocolFailure] = [:]
     public private(set) var preparing = false
@@ -57,6 +59,7 @@ public final class MacRuntime {
     public private(set) var clipboardAllowed = false
     public private(set) var lockAllowed = false
     public private(set) var lockAuthorizationRequested = false
+    private let preferences: UserDefaults
     private let store: TransferStore
     private let pasteboard = PasteboardBridge()
     private let locker = LockController()
@@ -65,6 +68,17 @@ public final class MacRuntime {
     private var lan = false
     private var offers: [UUID: Task<Void, Never>] = [:]
     private var observation: [NSObjectProtocol] = []
+    private struct ClipboardRequest {
+        let file: URL?
+        let text: String?
+        let mime: String?
+        var targets: Set<UUID>
+    }
+    private var pendingClipboard: ClipboardRequest?
+    private var preparingClipboardTargets: Set<UUID> = []
+    private var clipboardWorker: Task<Void, Never>?
+    private var clipboardPreparation: Task<Snapshot, any Error>?
+
     @ObservationIgnored private lazy var coordinator = SyncCoordinator(identity: configuration.identity, role: .mac, store: store) { [weak self] event in
         try await self?.event(event)
     }
@@ -81,14 +95,15 @@ public final class MacRuntime {
         return client
     }()
 
-    public init() throws {
-        if let data = UserDefaults.standard.data(forKey: "Andcintosh.configuration") {
+    public init(preferences: UserDefaults = .standard, root: URL? = nil, downloads: URL? = nil) throws {
+        self.preferences = preferences
+        if let data = preferences.data(forKey: "Andcintosh.configuration") {
             configuration = try Wire.decodeJSON(MacConfiguration.self, data)
         } else { configuration = MacConfiguration() }
         let manager = FileManager.default
-        let root = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Andcintosh")
-        let downloads = try manager.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Andcintosh")
-        store = try TransferStore(root: root, downloads: downloads)
+        let dataRoot = try root ?? manager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Andcintosh")
+        let outputRoot = try downloads ?? manager.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Andcintosh")
+        store = try TransferStore(root: dataRoot, downloads: outputRoot)
     }
 
     public func start() {
@@ -103,10 +118,7 @@ public final class MacRuntime {
         }
         pasteboard.changed = { [weak self] file, text, mime in
             guard let self else { return }
-            Task {
-                do { try await self.clipboard(file: file, text: text, mime: mime, targets: self.connected) }
-                catch { for peer in self.connected { self.failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable } }
-            }
+            self.queueClipboard(file: file, text: text, mime: mime, targets: self.connected)
         }
         let monitor = NWPathMonitor()
         self.monitor = monitor
@@ -134,6 +146,15 @@ public final class MacRuntime {
             }
             await coordinator.wifi(configuration.wifi && lan)
         }
+    }
+    public func movePeers(from offsets: IndexSet, to destination: Int) {
+        guard offsets.allSatisfy({ configuration.peers.indices.contains($0) }),
+              (0...configuration.peers.count).contains(destination), !offsets.isEmpty else { return }
+        let moved = offsets.sorted().map { configuration.peers[$0] }
+        var remaining = configuration.peers.enumerated().filter { !offsets.contains($0.offset) }.map(\.element)
+        remaining.insert(contentsOf: moved, at: destination - offsets.filter { $0 < destination }.count)
+        configuration.peers = remaining
+        persist()
     }
     public func refreshPermissions() { clipboardAllowed = pasteboard.permitted; lockAllowed = locker.permitted }
     public func scan() { start(); discovered.removeAll(); bluetooth.scan() }
@@ -200,14 +221,16 @@ public final class MacRuntime {
     public func stop() async {
         let wasRunning = running
         running = false
+        pendingClipboard = nil; clipboardPreparation?.cancel(); clipboardWorker?.cancel()
+        await clipboardWorker?.value
         locker.stop(); pasteboard.stop(); monitor?.cancel(); monitor = nil; lan = false
         for task in offers.values { task.cancel() }; offers.removeAll()
         if wasRunning { await bluetooth.stop() } else { await coordinator.stop() }
         await server.stop()
         for token in observation { NSWorkspace.shared.notificationCenter.removeObserver(token) }; observation.removeAll()
-        connected.removeAll()
+        connected.removeAll(); routes.removeAll(); switching.removeAll()
     }
-    private func persist() { UserDefaults.standard.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
+    private func persist() { preferences.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
     private func configureLock() {
         try? locker.setDelay(seconds: configuration.lockDelaySeconds)
         try? locker.configure(enabled: configuration.lockEnabled,
@@ -230,26 +253,64 @@ public final class MacRuntime {
             catch { self.failures[peer] = error as? ProtocolFailure ?? .peerUnavailable }
         }
     }
-    private func clipboard(file: URL?, text: String?, mime: String?, targets: Set<UUID>) async throws {
-        guard !targets.isEmpty else { return }
-        let snapshot: Snapshot
-        if let file, let mime { snapshot = try await store.snapshot(file, kind: .image, name: file.lastPathComponent, mime: mime, origin: configuration.identity) }
-        else if let text { snapshot = try await store.snapshotText(text, origin: configuration.identity) }
-        else { throw ProtocolFailure.originalUnavailable }
-        try await coordinator.enqueue(snapshot, targets: targets, userInitiated: false)
+    private func queueClipboard(file: URL?, text: String?, mime: String?, targets: Set<UUID>) {
+        guard running, !targets.isEmpty else { return }
+        let merged = targets.union(pendingClipboard?.targets ?? []).union(preparingClipboardTargets)
+        pendingClipboard = ClipboardRequest(file: file, text: text, mime: mime, targets: merged)
+        clipboardPreparation?.cancel()
+        guard clipboardWorker == nil else { return }
+        clipboardWorker = Task { [weak self] in
+            guard let self else { return }
+            defer { self.clipboardWorker = nil; self.clipboardPreparation = nil; self.preparingClipboardTargets = [] }
+            while self.running, !Task.isCancelled, let request = self.pendingClipboard {
+                self.pendingClipboard = nil
+                self.preparingClipboardTargets = request.targets
+                let preparation = Task<Snapshot, any Error> { [store = self.store, origin = self.configuration.identity] in
+                    try Task.checkCancellation()
+                    if let file = request.file, let mime = request.mime {
+                        return try await store.snapshot(file, kind: .image, name: file.lastPathComponent, mime: mime, origin: origin)
+                    }
+                    if let text = request.text { return try await store.snapshotText(text, origin: origin) }
+                    throw ProtocolFailure.originalUnavailable
+                }
+                self.clipboardPreparation = preparation
+                do {
+                    let snapshot = try await preparation.value
+                    if preparation.isCancelled || !self.running || self.pendingClipboard != nil {
+                        await self.store.release(snapshot.url)
+                    } else {
+                        var seen: Set<UUID> = []
+                        let targets = self.configuration.peers.compactMap(\.identity).filter {
+                            request.targets.contains($0) && self.connected.contains($0) && seen.insert($0).inserted
+                        }
+                        if targets.isEmpty { await self.store.release(snapshot.url) }
+                        else { try await self.coordinator.enqueue(snapshot, targets: targets, userInitiated: false) }
+                    }
+                } catch is CancellationError { }
+                catch {
+                    if !preparation.isCancelled && self.running {
+                        for peer in request.targets { self.failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable }
+                    }
+                }
+                self.clipboardPreparation = nil; self.preparingClipboardTargets = []
+            }
+        }
     }
     private func event(_ event: SyncEvent) async throws {
         switch event {
         case .connected(let peer):
             guard running, bluetooth.sessionAuthenticated(peer) else { return }
             failures.removeValue(forKey: peer)
+            if let device = configuration.peers.first(where: { $0.identity == peer }) { failures.removeValue(forKey: device.id) }
+            routes[peer] = .ble; switching.remove(peer)
             connected.insert(peer); locker.connected(peer); pasteboard.start()
             if pasteboard.permitted {
-                do { let value = try pasteboard.current(); try await clipboard(file: value.0, text: value.1, mime: value.2, targets: [peer]) }
+                do { let value = try pasteboard.current(); queueClipboard(file: value.0, text: value.1, mime: value.2, targets: [peer]) }
                 catch { failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable }
             }
             scheduleOffer(peer)
         case .disconnected(let peer, let intentional):
+            routes.removeValue(forKey: peer); switching.remove(peer)
             connected.remove(peer); locker.disconnected(peer, intentional: intentional)
             bluetooth.sessionDisconnected(peer, intentional: intentional)
             offers.removeValue(forKey: peer)?.cancel()
@@ -265,6 +326,10 @@ public final class MacRuntime {
                 if !eligible { await server.stop() }
             }
         case .completed(_, let id): progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
+        case .transportChanged(let peer, let route):
+            guard connected.contains(peer) else { return }
+            if let route { routes[peer] = route; switching.remove(peer) }
+            else { switching.insert(peer) }
         case .tcpOffer: break
         }
     }

@@ -20,6 +20,7 @@ private struct Incoming {
     var journal: IncomingJournal
     var handle: FileHandle?
     var written: UInt64
+    var generation = UUID()
 }
 
 public actor TransferStore {
@@ -28,6 +29,7 @@ public actor TransferStore {
     private var incoming: [String: Incoming] = [:]
     private var readers: [URL: FileHandle] = [:]
     private var epochs: [UUID: UUID] = [:]
+    private var verifications: [String: VerificationLease] = [:]
     private let checkpointBytes: UInt64 = 4 * 1_024 * 1_024
 
     public init(root: URL, downloads: URL) throws {
@@ -54,11 +56,16 @@ public actor TransferStore {
         defer { try? output.close(); if !success { try? FileManager.default.removeItem(at: destination) } }
         var digest = SHA256()
         var count: UInt64 = 0
-        while let bytes = try input.read(upToCount: 65_536), !bytes.isEmpty {
-            try Task.checkCancellation()
-            try output.write(contentsOf: bytes)
-            digest.update(data: bytes)
-            count += UInt64(bytes.count)
+        while true {
+            let read = try autoreleasepool {
+                try Task.checkCancellation()
+                guard let bytes = try input.read(upToCount: 65_536), !bytes.isEmpty else { return 0 }
+                try output.write(contentsOf: bytes)
+                digest.update(data: bytes)
+                return bytes.count
+            }
+            if read == 0 { break }
+            count += UInt64(read)
         }
         try output.synchronize()
         let manifest = try TransferManifest(id: id, kind: kind, name: name, mime: mime, size: count,
@@ -91,6 +98,15 @@ public actor TransferStore {
         try? FileManager.default.removeItem(at: snapshot)
     }
 
+    public func closeHandles() {
+        for handle in readers.values { try? handle.close() }
+        readers.removeAll()
+        for key in Array(incoming.keys) {
+            verifications[key]?.cancel()
+            try? incoming[key]?.handle?.close(); incoming[key]?.handle = nil
+        }
+    }
+
     public func collectClipboard(keeping: Set<URL>) {
         let directory = root.appendingPathComponent("clipboard")
         for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [] where !keeping.contains(url) {
@@ -115,15 +131,23 @@ public actor TransferStore {
         }
     }
 
-    public func selectEpoch(peer: UUID, epoch: UUID) { epochs[peer] = epoch }
+    public func selectEpoch(peer: UUID, epoch: UUID) {
+        if epochs[peer] != epoch {
+            for (key, item) in incoming where item.journal.peer == peer { verifications[key]?.cancel() }
+        }
+        epochs[peer] = epoch
+    }
 
     public func begin(_ manifest: TransferManifest, peer: UUID, epoch: UUID? = nil) throws -> UInt64 {
         if let epoch, epochs[peer] != epoch { throw ProtocolFailure.invalidOffset }
         try manifest.validate()
         let key = identity(peer, manifest.id)
+        verifications.removeValue(forKey: key)?.cancel()
         if var current = incoming[key] {
             guard current.journal.manifest == manifest else { throw ProtocolFailure.invalidManifest }
             if current.journal.complete { return manifest.size }
+            current.generation = UUID()
+            if current.handle == nil { current.handle = try FileHandle(forUpdating: root.appendingPathComponent("incoming/\(key)/data.part")) }
             try current.handle?.truncate(atOffset: current.journal.durable)
             try current.handle?.seek(toOffset: current.journal.durable)
             current.written = current.journal.durable
@@ -173,7 +197,7 @@ public actor TransferStore {
         return checkpoint ? item.journal.durable : nil
     }
 
-    public func finish(peer: UUID, id: UUID, epoch: UUID? = nil) throws -> (TransferManifest, URL, Bool) {
+    public func finish(peer: UUID, id: UUID, epoch: UUID? = nil) async throws -> (TransferManifest, URL, Bool) {
         if let epoch, epochs[peer] != epoch { throw ProtocolFailure.invalidOffset }
         let key = identity(peer, id)
         guard var item = incoming[key] else { throw ProtocolFailure.invalidOffset }
@@ -186,13 +210,23 @@ public actor TransferStore {
         try item.handle?.close()
         item.handle = nil
         let source = root.appendingPathComponent("incoming/\(key)/data.part")
-        guard try hash(source) == manifest.sha256 else {
-            try? FileManager.default.removeItem(at: root.appendingPathComponent("incoming/\(key)"))
-            incoming.removeValue(forKey: key)
-            throw ProtocolFailure.digestMismatch
+        incoming[key] = item
+        let lease = VerificationLease()
+        verifications.removeValue(forKey: key)?.cancel(); verifications[key] = lease
+        defer { if verifications[key] === lease { verifications.removeValue(forKey: key) } }
+        let staging = manifest.kind == .file ? downloads.appendingPathComponent(".\(id.uuidString).\(UUID().uuidString).part") : nil
+        if staging != nil { try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true) }
+        defer { if let staging { try? FileManager.default.removeItem(at: staging) } }
+        let verified: URL
+        do { verified = try await VerificationWorker.prepare(source: source, staging: staging, sha256: manifest.sha256, lease: lease) }
+        catch {
+            if incoming[key]?.generation == item.generation, (error as? ProtocolFailure) == .digestMismatch { cancel(peer: peer, id: id) }
+            throw error
         }
+        try lease.check()
+        guard incoming[key]?.generation == item.generation, epoch == nil || epochs[peer] == epoch else { throw ProtocolFailure.invalidOffset }
         let destination: URL
-        if manifest.kind == .file { destination = try publish(source, name: manifest.name, id: id) }
+        if manifest.kind == .file { destination = try publish(verified, name: manifest.name, id: id) }
         else {
             destination = root.appendingPathComponent("clipboard/\(id.uuidString).blob")
             if !FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.moveItem(at: source, to: destination) }
@@ -202,12 +236,14 @@ public actor TransferStore {
         item.journal.output = destination.path
         try save(item.journal, at: journalURL(key))
         incoming[key] = item
+        if manifest.kind == .file { try? FileManager.default.removeItem(at: source) }
         return (manifest, destination, true)
     }
 
     public func cancel(peer: UUID, id: UUID) {
         let key = identity(peer, id)
         if let current = incoming[key], current.journal.complete { return }
+        verifications.removeValue(forKey: key)?.cancel()
         try? incoming.removeValue(forKey: key)?.handle?.close()
         try? FileManager.default.removeItem(at: root.appendingPathComponent("incoming/\(key)"))
     }
@@ -234,18 +270,9 @@ public actor TransferStore {
     private func journalURL(_ key: String) -> URL { root.appendingPathComponent("incoming/\(key)/state.json") }
     private func save(_ journal: IncomingJournal, at url: URL) throws { try Wire.encodeJSON(journal).write(to: url, options: .atomic) }
 
-    private func hash(_ source: URL) throws -> String {
-        let input = try FileHandle(forReadingFrom: source)
-        defer { try? input.close() }
-        var digest = SHA256()
-        while let bytes = try input.read(upToCount: 65_536), !bytes.isEmpty { digest.update(data: bytes) }
-        return Data(digest.finalize()).hex
-    }
-
     private func publish(_ source: URL, name: String, id: UUID) throws -> URL {
         try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
-        let hidden = downloads.appendingPathComponent(".\(id.uuidString).part")
-        if !FileManager.default.fileExists(atPath: hidden.path) { try FileManager.default.copyItem(at: source, to: hidden) }
+        let hidden = source
         let ext = (name as NSString).pathExtension
         let stem = ext.isEmpty ? name : (name as NSString).deletingPathExtension
         var index = 0
@@ -254,7 +281,6 @@ public actor TransferStore {
             let url = downloads.appendingPathComponent(candidate)
             if link(hidden.path, url.path) == 0 {
                 try FileManager.default.removeItem(at: hidden)
-                try? FileManager.default.removeItem(at: source)
                 return url
             }
             guard errno == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }

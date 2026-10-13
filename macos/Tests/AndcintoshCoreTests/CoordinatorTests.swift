@@ -43,10 +43,12 @@ private actor EventRecorder {
     var received: [UUID: URL] = [:]
     var sent: UInt64 = 0
     var errors: [ProtocolFailure] = []
+    var routes: [UUID: TransportKind] = [:]
     func record(_ event: SyncEvent) {
         switch event {
         case .completed(_, let id): complete.insert(id)
         case .received(_, let manifest, let file): received[manifest.id] = file
+        case .transportChanged(let peer, let route): routes[peer] = route
         case .progress(_, _, let offset, _): sent = offset
         case .failed(_, _, let error): errors.append(error)
         default: break
@@ -89,8 +91,10 @@ private actor EventRecorder {
     try await left.installTCP(phone, channel: EncryptedChannel(raw: c, authentication: authC, transport: .tcp), context: offer.id)
     try await right.installTCP(mac, channel: EncryptedChannel(raw: d, authentication: authD, transport: .tcp), context: offer.id)
     #expect(await left.usingTCP(phone))
+    #expect(await events.routes[phone] == .tcp)
     try await Task.sleep(for: .milliseconds(3))
     await left.wifi(false)
+    #expect(await events.routes[phone] == .ble)
     for _ in 0..<600 { if await events.complete.contains(snapshot.manifest.id) { break }; try await Task.sleep(for: .milliseconds(5)) }
     let delivered = await events.received[snapshot.manifest.id]
     #expect(delivered != nil)

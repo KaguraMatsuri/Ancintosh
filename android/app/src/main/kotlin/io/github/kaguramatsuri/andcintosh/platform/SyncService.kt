@@ -63,7 +63,9 @@ class SyncService : Service() {
         super.onCreate()
         foregroundNotification()
         val settings = DeviceSettings(this)
-        val store = TransferStore(File(filesDir, "state")) { file, manifest -> FileAccess.publish(this, file, manifest) }
+        val store = TransferStore(File(filesDir, "state"), stagedPublish = { file, manifest, check, commit ->
+            FileAccess.publish(this, file, manifest, commit, check)
+        }) { file, manifest -> FileAccess.publish(this, file, manifest) }
         files = FileAccess(this, store, settings.identity)
         session = SessionController(settings.identity, scope, store) { event ->
             if (event is SyncEvent.Connected && session.connected != event.peer) return@SessionController

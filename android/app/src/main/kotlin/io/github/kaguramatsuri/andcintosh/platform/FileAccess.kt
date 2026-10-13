@@ -82,7 +82,7 @@ class FileAccess(private val context: Context, private val store: TransferStore,
         }
     }
     companion object {
-        fun publish(context: Context, file: File, manifest: Manifest): String {
+        fun publish(context: Context, file: File, manifest: Manifest, commit: PublicationCommit = { it() }, check: () -> Unit = {}): String {
             val resolver = context.contentResolver
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, manifest.name)
@@ -95,12 +95,19 @@ class FileAccess(private val context: Context, private val store: TransferStore,
             try {
                 resolver.openFileDescriptor(uri, "w")?.use { descriptor ->
                     java.io.FileOutputStream(descriptor.fileDescriptor).use { output ->
-                        file.inputStream().use { it.copyTo(output, 65536) }; output.fd.sync()
+                        file.inputStream().use { input ->
+                            val bytes = ByteArray(65536)
+                            while (true) { check(); val count = input.read(bytes); if (count < 0) break; output.write(bytes, 0, count) }
+                        }
+                        check(); output.fd.sync()
                     }
                 } ?: fail(Failure.permissionDenied)
-                val pending = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-                if (resolver.update(uri, pending, null, null) != 1) fail(Failure.permissionDenied)
-                committed = true; file.delete(); return uri.toString()
+                val result = commit {
+                    val pending = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                    if (resolver.update(uri, pending, null, null) != 1) fail(Failure.permissionDenied)
+                    uri.toString()
+                }
+                committed = true; file.delete(); return result
             } finally { if (!committed) resolver.delete(uri, null, null) }
         }
     }

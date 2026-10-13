@@ -42,6 +42,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         ble?.close(); tcp?.close(); tcp = null; ble = channel; peer = auth.peer; offer = null
         val root = ByteBuffer.wrap(channel.root)
         epoch = UUID(root.long, root.long); awaitingFallback = false
+        channel.setDataEpoch(epoch)
         store.selectEpoch(auth.peer, epoch)
         state.withLock {
             queue.removeAll { it.snapshot.manifest.kind != PayloadKind.FILE }
@@ -55,6 +56,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         if (!wifi || !remoteWifi || context != offer || ble == null) { channel.close(); fail(Failure.authenticationFailed) }
         tcp?.close(); tcp = channel
         epoch = context; awaitingFallback = false
+        ble?.setDataEpoch(null); channel.setDataEpoch(epoch)
         peer?.let { store.selectEpoch(it, epoch) }
         reset(); scope.launch { readLoop(channel, true) }; pump()
     }
@@ -67,6 +69,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", true).bytes())) }
     suspend fun tcpLost() {
         val previous = tcp; tcp = null; offer = null; awaitingFallback = true; previous?.close()
+        ble?.setDataEpoch(null)
         peer?.let(store::checkpoint); reset()
         ble?.send(Record(RecordKind.TRANSPORT_SWITCH, metadata = JSONObject().put("transport", "ble").bytes()))
     }
@@ -74,7 +77,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         val current = peer ?: return
         if (intentional) runCatching { ble?.send(Record(RecordKind.GOODBYE)) }
         peer = null; ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
-        store.checkpoint(current); reset(); events(SyncEvent.Disconnected(current, intentional))
+        store.checkpoint(current); store.closeHandles(); reset(); events(SyncEvent.Disconnected(current, intentional))
     }
     suspend fun enqueue(snapshot: Snapshot) {
         val target = peer ?: fail(Failure.peerUnavailable)
@@ -97,43 +100,61 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             queue.removeAll { it.snapshot.manifest.id == id }; store.persist(queue); source
         }
         if (source != null) store.release(source)
+        (tcp ?: ble)?.discardBuffered(id)
         runCatching { (tcp ?: ble)?.send(Record(RecordKind.CANCEL, id, epoch = epoch)) }
         peer?.let { store.cancel(it, id) }; pump()
     }
     private suspend fun reset() = state.withLock { queue.forEach { it.begun = false; it.waiting = false; it.finished = false }; store.persist(queue) }
+    private fun nextReadyJob(): OutboundJob? {
+        queue.firstOrNull { it.snapshot.manifest.kind != PayloadKind.FILE && !it.finished && !it.waiting && it.failed == null }?.let { return it }
+        return queue.firstOrNull { it.snapshot.manifest.kind == PayloadKind.FILE && it.failed == null }
+            ?.takeIf { !it.finished && !it.waiting }
+    }
     private fun pump() { scope.launch { drain() } }
     private suspend fun drain() {
         state.withLock { if (pumping) return; pumping = true }
         try {
             while (peer != null && !awaitingFallback) {
                 val channel = tcp ?: ble ?: return
-                val job = state.withLock {
-                    val clip = queue.firstOrNull { it.snapshot.manifest.kind != PayloadKind.FILE && !it.finished && !it.waiting && it.failed == null }
-                    val file = queue.firstOrNull { it.snapshot.manifest.kind == PayloadKind.FILE && it.failed == null }
-                    clip ?: file?.takeIf { !it.finished && !it.waiting }
-                } ?: return
+                val job = state.withLock { nextReadyJob()?.copy() } ?: return
+                val selectedEpoch = epoch
                 try {
-                    val record = state.withLock {
-                        if (queue.none { it === job }) return@withLock null
-                        if (!job.begun) {
-                            job.begun = true; job.waiting = true
-                            Record(RecordKind.BEGIN, job.snapshot.manifest.id, metadata = job.snapshot.manifest.json().bytes())
-                        } else if (job.offset < job.snapshot.manifest.size) {
+                    if (job.begun && job.offset < job.snapshot.manifest.size) {
+                        channel.sendBuffered {
                             val count = minOf(if (channel.transport == Transport.tcp) Wire.TCP_CHUNK.toLong() else Wire.BLE_CHUNK.toLong(), job.snapshot.manifest.size - job.offset).toInt()
-                            val bytes = store.read(job.snapshot, job.offset, count); if (bytes.isEmpty()) fail(Failure.sourceUnavailable)
-                            val offset = job.offset; job.offset += bytes.size
-                            Record(RecordKind.DATA, job.snapshot.manifest.id, offset, bytes = bytes)
-                        } else { job.finished = true; Record(RecordKind.FINISH, job.snapshot.manifest.id, job.offset) }
-                    } ?: continue
-                    channel.send(record.copy(epoch = epoch))
+                            val bytes = store.read(job.snapshot, job.offset, count)
+                            if (bytes.isEmpty()) fail(Failure.sourceUnavailable)
+                            state.withLock {
+                                val current = queue.firstOrNull { it.snapshot.manifest.id == job.snapshot.manifest.id } ?: fail(Failure.cancelled)
+                                if (selectedEpoch != epoch || channel !== (tcp ?: ble) || awaitingFallback) fail(Failure.peerUnavailable)
+                                if (current.offset != job.offset) fail(Failure.invalidOffset)
+                                current.offset += bytes.size
+                                Record(RecordKind.DATA, job.snapshot.manifest.id, job.offset, bytes = bytes, epoch = selectedEpoch)
+                            }
+                        }
+                    } else {
+                        val record = state.withLock {
+                            val current = queue.firstOrNull { it.snapshot.manifest.id == job.snapshot.manifest.id } ?: return@withLock null
+                            if (!current.begun) {
+                                current.begun = true; current.waiting = true
+                                Record(RecordKind.BEGIN, current.snapshot.manifest.id, metadata = current.snapshot.manifest.json().bytes(), epoch = selectedEpoch)
+                            } else {
+                                current.finished = true
+                                Record(RecordKind.FINISH, current.snapshot.manifest.id, current.offset, epoch = selectedEpoch)
+                            }
+                        } ?: continue
+                        channel.send(record)
+                    }
+                    val progress = state.withLock { queue.firstOrNull { it.snapshot.manifest.id == job.snapshot.manifest.id }?.offset } ?: continue
                     val now = System.nanoTime()
-                    if (job.offset == job.snapshot.manifest.size || now - (lastProgress[job.snapshot.manifest.id] ?: 0L) >= 200_000_000L) {
+                    if (progress == job.snapshot.manifest.size || now - (lastProgress[job.snapshot.manifest.id] ?: 0L) >= 200_000_000L) {
                         lastProgress[job.snapshot.manifest.id] = now
-                        events(SyncEvent.Progress(job.snapshot.manifest.id, job.offset, job.snapshot.manifest.size))
+                        events(SyncEvent.Progress(job.snapshot.manifest.id, progress, job.snapshot.manifest.size))
                     }
                 } catch (error: Exception) {
+                    if (error is ProtocolException && error.code == Failure.cancelled) continue
                     if (error is ProtocolException && error.code == Failure.sourceUnavailable) {
-                        state.withLock { job.failed = error.code; store.persist(queue) }; events(SyncEvent.Failed(job.snapshot.manifest.id, error.code))
+                        state.withLock { queue.firstOrNull { it.snapshot.manifest.id == job.snapshot.manifest.id }?.failed = error.code; store.persist(queue) }; events(SyncEvent.Failed(job.snapshot.manifest.id, error.code))
                     } else {
                         reset()
                         if (channel === (tcp ?: ble)) { if (channel.transport == Transport.tcp) tcpLost() else disconnect() }
@@ -144,7 +165,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         } finally {
             val ready = state.withLock {
                 pumping = false
-                queue.any { !it.begun && it.failed == null } || queue.any { it.begun && !it.waiting && !it.finished && it.failed == null }
+                nextReadyJob() != null
             }
             if (ready && peer != null && !awaitingFallback) pump()
         }
@@ -219,6 +240,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                     if (isTCP || record.epoch == Wire.ZERO_ID || record.json().getString("transport") != "ble") fail(Failure.invalidFrame)
                     val previous = tcp; tcp = null; previous?.close(); offer = null
                     epoch = record.epoch; awaitingFallback = false
+                    ble?.setDataEpoch(epoch)
                     store.selectEpoch(current, epoch)
                     store.checkpoint(current); reset()
                 }

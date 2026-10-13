@@ -9,19 +9,29 @@ import java.security.MessageDigest
 import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class Snapshot(val manifest: Manifest, val file: File)
 data class OutboundJob(val peer: UUID, val snapshot: Snapshot, val user: Boolean, var offset: Long = 0,
                        var begun: Boolean = false, var waiting: Boolean = false, var finished: Boolean = false,
                        var failed: Failure? = null)
 data class Received(val manifest: Manifest, val file: File, val output: String, val fresh: Boolean)
-private data class Incoming(val manifest: Manifest, val peer: UUID, val directory: File, var handle: RandomAccessFile?,
-                            var written: Long, var durable: Long, var complete: Boolean, var delivered: Boolean, var output: String?)
+typealias PublicationCommit = (() -> String) -> String
+typealias StagedPublisher = (File, Manifest, () -> Unit, PublicationCommit) -> String
 
-class TransferStore(val root: File, private val publish: (File, Manifest) -> String) {
+private data class Incoming(val manifest: Manifest, val peer: UUID, val directory: File, var handle: RandomAccessFile?,
+                            var written: Long, var durable: Long, var complete: Boolean, var delivered: Boolean, var output: String?, var generation: UUID = UUID.randomUUID())
+
+class TransferStore(val root: File, private val stagedPublish: StagedPublisher? = null, private val publish: (File, Manifest) -> String) {
     private val incoming = mutableMapOf<String, Incoming>()
     private val readers = mutableMapOf<File, RandomAccessFile>()
     private val epochs = mutableMapOf<UUID, UUID>()
+    private val verifications = mutableMapOf<String, AtomicBoolean>()
+    private val verification = Mutex()
     init { listOf(root, File(root, "outgoing"), File(root, "incoming"), File(root, "clipboard")).forEach { it.mkdirs() } }
 
     fun snapshot(input: InputStream, kind: PayloadKind, name: String, mime: String, origin: UUID): Snapshot {
@@ -48,6 +58,11 @@ class TransferStore(val root: File, private val publish: (File, Manifest) -> Str
         return if (read < 0) byteArrayOf() else bytes.copyOf(read)
     }
     @Synchronized fun release(file: File) { readers.remove(file)?.close(); if (file.parentFile == File(root, "outgoing")) file.delete() }
+    @Synchronized fun closeHandles() {
+        readers.values.forEach { runCatching { it.close() } }; readers.clear()
+        verifications.values.forEach { it.set(true) }
+        incoming.values.forEach { runCatching { it.handle?.close() }; it.handle = null }
+    }
     @Synchronized fun collectClipboard(keeping: Set<File>) {
         File(root,"clipboard").listFiles()?.forEach { directory ->
             if (keeping.none { it.parentFile == directory }) directory.deleteRecursively()
@@ -72,13 +87,19 @@ class TransferStore(val root: File, private val publish: (File, Manifest) -> Str
                 failed = job.optString("failed").takeIf { it.isNotEmpty() }?.let(Failure::valueOf))
         }
     }
-    @Synchronized fun selectEpoch(peer: UUID, epoch: UUID) { epochs[peer] = epoch }
+    @Synchronized fun selectEpoch(peer: UUID, epoch: UUID) {
+        if (epochs[peer] != epoch) incoming.filterValues { it.peer == peer }.keys.forEach { verifications[it]?.set(true) }
+        epochs[peer] = epoch
+    }
     @Synchronized fun begin(manifest: Manifest, peer: UUID, epoch: UUID? = null): Long {
         if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
         val key = "$peer/${manifest.id}"
+        verifications.remove(key)?.set(true)
         incoming[key]?.let {
             if (it.manifest != manifest) fail(Failure.invalidManifest)
             if (it.complete) return manifest.size
+            it.generation = UUID.randomUUID()
+            if (it.handle == null) it.handle = RandomAccessFile(File(it.directory, "data.part"), "rw")
             it.handle!!.setLength(it.durable); it.handle!!.seek(it.durable); it.written = it.durable
             return it.durable
         }
@@ -105,25 +126,58 @@ class TransferStore(val root: File, private val publish: (File, Manifest) -> Str
         item.handle!!.fd.sync(); item.durable = item.written; save(item)
         return item.durable
     }
-    @Synchronized fun finish(peer: UUID, id: UUID, epoch: UUID? = null): Received {
-        if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
-        val item = incoming["$peer/$id"] ?: fail(Failure.invalidOffset)
-        if (item.complete) return Received(item.manifest, File(item.output!!), item.output!!, !item.delivered)
-        if (item.written != item.manifest.size) fail(Failure.invalidOffset)
-        item.handle!!.fd.sync(); item.handle!!.close(); item.handle = null
-        val part = File(item.directory, "data.part")
-        val digest = MessageDigest.getInstance("SHA-256")
-        part.inputStream().use { input -> val b = ByteArray(65536); while (true) { val n = input.read(b); if (n < 0) break; digest.update(b, 0, n) } }
-        if (digest.digest().hex() != item.manifest.sha256.lowercase()) { cancel(peer, id); fail(Failure.digestMismatch) }
-        val output = if (item.manifest.kind == PayloadKind.FILE) publish(part, item.manifest) else {
-            val directory = File(root, "clipboard/$id"); directory.mkdirs()
-            val target = File(directory, item.manifest.name)
-            Files.move(part.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            atomic(File(directory, "manifest.json"), item.manifest.json().bytes())
-            target.absolutePath
+    suspend fun finish(peer: UUID, id: UUID, epoch: UUID? = null): Received = verification.withLock {
+        withContext(Dispatchers.IO) {
+            val key = "$peer/$id"
+            val cancelled = AtomicBoolean(false)
+            val item = synchronized(this@TransferStore) {
+                if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
+                val found = incoming[key] ?: fail(Failure.invalidOffset)
+                if (found.complete) return@withContext Received(found.manifest, File(found.output!!), found.output!!, !found.delivered)
+                if (found.written != found.manifest.size) fail(Failure.invalidOffset)
+                found.handle?.fd?.sync(); found.handle?.close(); found.handle = null
+                verifications[key] = cancelled
+                found
+            }
+            val generation = item.generation
+            val part = File(item.directory, "data.part")
+            val check = {
+                if (cancelled.get()) fail(Failure.cancelled)
+                synchronized(this@TransferStore) {
+                    if (incoming[key]?.generation != generation || (epoch != null && epochs[peer] != epoch)) fail(Failure.invalidOffset)
+                }
+            }
+            try {
+                val digest = MessageDigest.getInstance("SHA-256")
+                part.inputStream().use { input ->
+                    val bytes = ByteArray(65536)
+                    while (true) { check(); val count = input.read(bytes); if (count < 0) break; digest.update(bytes, 0, count) }
+                }
+                check()
+                if (digest.digest().hex() != item.manifest.sha256.lowercase()) { cancel(peer, id); fail(Failure.digestMismatch) }
+                val commit: PublicationCommit = { publish ->
+                    synchronized(this@TransferStore) {
+                        check()
+                        val output = publish()
+                        val complete = item.copy(complete = true, durable = item.manifest.size, output = output)
+                        save(complete); incoming[key] = complete
+                        output
+                    }
+                }
+                val output = if (item.manifest.kind == PayloadKind.FILE) {
+                    stagedPublish?.invoke(part, item.manifest, check, commit) ?: commit { publish(part, item.manifest) }
+                } else commit {
+                    val directory = File(root, "clipboard/$id"); directory.mkdirs()
+                    val target = File(directory, item.manifest.name)
+                    Files.move(part.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                    atomic(File(directory, "manifest.json"), item.manifest.json().bytes())
+                    target.absolutePath
+                }
+                Received(item.manifest, if (item.manifest.kind == PayloadKind.FILE) part else File(output), output, true)
+            } finally {
+                synchronized(this@TransferStore) { if (verifications[key] === cancelled) verifications.remove(key) }
+            }
         }
-        item.complete = true; item.durable = item.manifest.size; item.output = output; save(item)
-        return Received(item.manifest, if (item.manifest.kind == PayloadKind.FILE) part else File(output), output, true)
     }
     @Synchronized fun delivered(peer: UUID, id: UUID) { incoming["$peer/$id"]?.let { it.delivered = true; save(it) } }
     @Synchronized fun checkpoint(peer: UUID) {
@@ -134,6 +188,7 @@ class TransferStore(val root: File, private val publish: (File, Manifest) -> Str
     @Synchronized fun cancel(peer: UUID, id: UUID) {
         val item = incoming["$peer/$id"]
         if (item?.complete == true) return
+        verifications.remove("$peer/$id")?.set(true)
         incoming.remove("$peer/$id")?.handle?.close(); File(root, "incoming/$peer/$id").deleteRecursively()
     }
     private fun save(item: Incoming) {

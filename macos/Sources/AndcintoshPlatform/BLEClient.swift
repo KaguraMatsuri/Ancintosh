@@ -278,13 +278,14 @@ public final class StreamByteChannel: NSObject, ByteChannel, StreamDelegate, @un
         input.open(); output.open()
         lock.lock(); loop = CFRunLoopGetCurrent(); let initial = pending; pending.removeAll(); lock.unlock()
         for action in initial { action() }
-        CFRunLoopRun()
+        if !closed { CFRunLoopRun() }
         input.close(); output.close()
         input.remove(from: runLoop, forMode: .default); output.remove(from: runLoop, forMode: .default)
     }
 
     private func perform(_ action: @escaping @Sendable () -> Void) {
         lock.lock()
+        if closed { lock.unlock(); action(); return }
         if let loop {
             lock.unlock()
             CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue, action)
@@ -349,8 +350,10 @@ public final class StreamByteChannel: NSObject, ByteChannel, StreamDelegate, @un
         else { writing = request }
     }
     private func terminate() {
-        guard !closed else { return }
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
         closed = true
+        lock.unlock()
         reading?.2.resume(throwing: ProtocolFailure.peerUnavailable); reading = nil
         writing?.2.resume(throwing: ProtocolFailure.peerUnavailable); writing = nil
         input.close(); output.close()

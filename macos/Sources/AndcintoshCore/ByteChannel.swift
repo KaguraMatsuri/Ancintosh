@@ -50,9 +50,18 @@ public actor EncryptedChannel {
     public let root: Data
     private let raw: any ByteChannel
     private var crypto: CryptoSession
-    private var writes: [(Record, CheckedContinuation<Void, any Error>)] = []
+    private struct Write {
+        let record: Record
+        let continuation: CheckedContinuation<Void, any Error>?
+        let buffered: Bool
+    }
+    private var writes: [Write] = []
+    private let lifetime = ChannelLifetime()
+    private let slots = TransferSlots(count: 16)
     private var writing = false
     private var closed = false
+    private var dataEpoch: UUID?
+    private var discarded: Set<UUID> = []
 
     public init(raw: any ByteChannel, authentication: Authentication, transport: TransportKind) {
         self.raw = raw; crypto = authentication.session; root = authentication.session.root; self.transport = transport
@@ -61,16 +70,51 @@ public actor EncryptedChannel {
     public func send(_ record: Record) async throws {
         guard !closed else { throw ProtocolFailure.peerUnavailable }
         try await withCheckedThrowingContinuation { continuation in
-            writes.append((record, continuation))
+            writes.append(Write(record: record, continuation: continuation, buffered: false))
             if !writing { writing = true; Task { await self.drain() } }
         }
     }
 
+    public func sendBuffered(_ produce: @Sendable () async throws -> Record) async throws -> Int {
+        try await slots.acquire(lifetime)
+        do { try await TransferSlots.shared.acquire(lifetime) }
+        catch { await slots.release(); throw error }
+        do {
+            try Task.checkCancellation()
+            guard !closed else { throw ProtocolFailure.peerUnavailable }
+            let record = try await produce()
+            guard !closed, dataEpoch == record.epoch else { throw ProtocolFailure.peerUnavailable }
+            guard !discarded.contains(record.transferID) else { throw ProtocolFailure.cancelled }
+            guard record.kind == .data, record.bytes.count <= (transport == .tcp ? Wire.tcpChunkSize : Wire.bleChunkSize) else { throw ProtocolFailure.oversizedRecord }
+            writes.append(Write(record: record, continuation: nil, buffered: true))
+            if !writing { writing = true; Task { await self.drain() } }
+            return record.bytes.count
+        } catch { await releaseSlot(); throw error }
+    }
+    public func setDataEpoch(_ epoch: UUID?) async {
+        dataEpoch = epoch
+        let removed = writes.filter { $0.buffered && $0.record.epoch != epoch }
+        writes.removeAll { $0.buffered && $0.record.epoch != epoch }
+        for _ in removed { await releaseSlot() }
+    }
+    public func discardBuffered(_ id: UUID) async {
+        discarded.insert(id)
+        let removed = writes.filter { $0.buffered && $0.record.transferID == id }
+        writes.removeAll { $0.buffered && $0.record.transferID == id }
+        for _ in removed { await releaseSlot() }
+    }
+    private func releaseSlot() async { await slots.release(); await TransferSlots.shared.release() }
     private func drain() async {
         while !writes.isEmpty && !closed {
-            let (record, continuation) = writes.removeFirst()
-            do { try await raw.write(crypto.seal(record)); continuation.resume() }
-            catch { continuation.resume(throwing: error); await close() }
+            let write = writes.removeFirst()
+            do {
+                if !write.buffered || (write.record.epoch == dataEpoch && !discarded.contains(write.record.transferID)) {
+                    try await raw.write(crypto.seal(write.record))
+                }
+                write.continuation?.resume()
+            }
+            catch { write.continuation?.resume(throwing: error); await close() }
+            if write.buffered { await releaseSlot() }
         }
         writing = false
     }
@@ -89,9 +133,14 @@ public actor EncryptedChannel {
     public func close() async {
         guard !closed else { return }
         closed = true
+        lifetime.close()
+        await slots.removeClosedWaiters(); await TransferSlots.shared.removeClosedWaiters()
         let pending = writes
         writes.removeAll()
-        for (_, continuation) in pending { continuation.resume(throwing: ProtocolFailure.peerUnavailable) }
+        for write in pending {
+            write.continuation?.resume(throwing: ProtocolFailure.peerUnavailable)
+            if write.buffered { await releaseSlot() }
+        }
         await raw.close()
     }
 }
