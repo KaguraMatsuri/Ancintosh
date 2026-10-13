@@ -13,6 +13,7 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
+import android.os.PowerManager
 import io.github.kaguramatsuri.andcintosh.R
 import io.github.kaguramatsuri.andcintosh.core.*
 import io.github.kaguramatsuri.andcintosh.ui.MainActivity
@@ -49,6 +50,7 @@ class SyncService : Service() {
             scope.launch {
                 if (!status.value.running) return@launch
                 try {
+                    if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) { refreshPowerState(); return@launch }
                     when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
                         BluetoothAdapter.STATE_OFF -> { peripheral.stop()?.join(); session.disconnect() }
                         BluetoothAdapter.STATE_ON -> peripheral.start()
@@ -86,7 +88,11 @@ class SyncService : Service() {
             mutableStatus.update { it.copy(failure = code) }
             events.tryEmit(SyncEvent.Failed(Wire.ZERO_ID, code))
         }
-        registerReceiver(radio, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), Context.RECEIVER_EXPORTED)
+        registerReceiver(radio, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED).apply {
+            addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED); addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        }, Context.RECEIVER_EXPORTED)
+        refreshPowerState()
         startup = scope.launch {
             try {
                 session.restore()
@@ -105,6 +111,10 @@ class SyncService : Service() {
         startForeground(1, Notification.Builder(this, channel.id).setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle(getString(R.string.app_name)).setContentText(getString(R.string.notification_body))
             .setContentIntent(content).setOngoing(true).setOnlyAlertOnce(true).build())
+    }
+    private fun refreshPowerState() {
+        val power = getSystemService(PowerManager::class.java)
+        peripheral.powerState(power.isInteractive, power.isPowerSaveMode || power.isDeviceIdleMode)
     }
     private suspend fun startRadio() {
         session.wifi(DeviceSettings(this).wifi); tcp.start(); peripheral.start()

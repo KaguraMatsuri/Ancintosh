@@ -6,6 +6,10 @@ import android.bluetooth.*
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertisingSet
+import android.bluetooth.le.AdvertisingSetCallback
+import android.bluetooth.le.AdvertisingSetParameters
+import android.os.SystemClock
 import android.content.Context
 import android.os.ParcelUuid
 import io.github.kaguramatsuri.andcintosh.core.*
@@ -38,6 +42,23 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
     private var active: BluetoothByteChannel? = null
     private var activeDevice: BluetoothDevice? = null
     private var advertising: AdvertiseCallback? = null
+    private var setCallback: AdvertisingSetCallback? = null
+    private var advertisingSet: AdvertisingSet? = null
+    private var appliedInterval = 0
+    private var requestedInterval = 0
+    private var changingParameters = false
+    private var legacyFallback = false
+    private var powerTimer: Job? = null
+    private val power = DiscoveryPowerPolicy()
+    private val gattConnections = mutableSetOf<BluetoothDevice>()
+    @Synchronized fun powerState(interactive: Boolean, constrained: Boolean) {
+        power.environment(SystemClock.elapsedRealtime(), interactive, constrained)
+        advertise()
+    }
+    private fun parameters(intervalMillis: Int) = AdvertisingSetParameters.Builder()
+        .setLegacyMode(true).setConnectable(true).setScannable(true)
+        .setInterval(intervalMillis * 8 / 5).build()
+
     private fun callback(cycle: Long) = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             if (!current(cycle)) return
@@ -53,6 +74,10 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
         }
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (!current(cycle)) return
+            synchronized(this@BLEPeripheral) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) gattConnections.add(device)
+                if (newState == BluetoothProfile.STATE_DISCONNECTED) { gattConnections.remove(device); advertise(cycle) }
+            }
             if (newState == BluetoothProfile.STATE_CONNECTED && adapter.isLe2MPhySupported) {
                 try { gatt?.setPreferredPhy(device, BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_OPTION_NO_PREFERRED) }
                 catch (_: SecurityException) { failed(Failure.permissionDenied) }
@@ -75,6 +100,8 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
         settings.loadKey()
         running = true
         val cycle = ++generation
+        legacyFallback = false
+        power.start(SystemClock.elapsedRealtime())
         server = adapter.listenUsingInsecureL2capChannel()
         gatt = manager.openGattServer(context, callback(cycle)) ?: fail(Failure.unsupported)
         val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
@@ -97,7 +124,7 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
                     ensureActive()
                     val valid = synchronized(this@BLEPeripheral) {
                         if (!current(cycle) || active !== raw) false
-                        else { settings.mac = auth.peer; activeDevice = socket.remoteDevice; stopAdvertising(); true }
+                        else { settings.mac = auth.peer; activeDevice = socket.remoteDevice; power.connected(); stopAdvertising(); true }
                     }
                     if (!valid) { raw.close(); break }
                     session.installBLE(auth, EncryptedChannel(raw, auth, Transport.ble))
@@ -118,6 +145,74 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
     }
     @Synchronized
     private fun advertise(cycle: Long = generation) {
+        if (!current(cycle) || session.connected != null) return
+        if (legacyFallback) { advertiseLegacy(cycle); return }
+        val now = SystemClock.elapsedRealtime()
+        val interval = power.intervalMillis(now) ?: return
+        powerTimer?.cancel(); powerTimer = null
+        power.nextChange(now)?.let { deadline ->
+            powerTimer = scope.launch {
+                delay((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1))
+                if (current(cycle)) advertise(cycle)
+            }
+        }
+        try {
+            val advertiser = adapter.bluetoothLeAdvertiser ?: return failed(Failure.unsupported)
+            if (setCallback != null) {
+                if (advertisingSet != null && appliedInterval != interval && !changingParameters && active == null && gattConnections.isEmpty()) {
+                    changingParameters = true
+                    advertisingSet?.enableAdvertising(false, 0, 0)
+                }
+                return
+            }
+            requestedInterval = interval
+            val callback = object : AdvertisingSetCallback() {
+                private fun valid() = current(cycle) && setCallback === this
+                override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
+                    synchronized(this@BLEPeripheral) {
+                        if (!valid()) return
+                        if (status != ADVERTISE_SUCCESS || set == null) { fallbackAdvertising(cycle); return }
+                        advertisingSet = set; appliedInterval = requestedInterval
+                        advertise(cycle)
+                    }
+                }
+                override fun onAdvertisingEnabled(set: AdvertisingSet, enabled: Boolean, status: Int) {
+                    synchronized(this@BLEPeripheral) {
+                        if (!valid()) return
+                        if (status != ADVERTISE_SUCCESS) { fallbackAdvertising(cycle); return }
+                        if (enabled) { changingParameters = false; advertise(cycle) }
+                        else if (active != null || gattConnections.isNotEmpty()) {
+                            set.enableAdvertising(true, 0, 0)
+                        } else {
+                            requestedInterval = power.intervalMillis(SystemClock.elapsedRealtime()) ?: return
+                            set.setAdvertisingParameters(parameters(requestedInterval))
+                        }
+                    }
+                }
+                override fun onAdvertisingParametersUpdated(set: AdvertisingSet, txPower: Int, status: Int) {
+                    synchronized(this@BLEPeripheral) {
+                        if (!valid()) return
+                        if (status != ADVERTISE_SUCCESS) { fallbackAdvertising(cycle); return }
+                        appliedInterval = requestedInterval
+                        set.enableAdvertising(true, 0, 0)
+                    }
+                }
+            }
+            setCallback = callback
+            advertiser.startAdvertisingSet(parameters(interval),
+                AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).build(),
+                AdvertiseData.Builder().setIncludeDeviceName(true).build(), null, null, callback)
+        } catch (_: SecurityException) { stopAdvertising(); failed(Failure.permissionDenied) }
+        catch (_: IllegalArgumentException) { fallbackAdvertising(cycle) }
+        catch (_: IllegalStateException) { fallbackAdvertising(cycle) }
+    }
+    @Synchronized
+    private fun fallbackAdvertising(cycle: Long) {
+        stopAdvertising(); legacyFallback = true
+        if (current(cycle)) advertiseLegacy(cycle)
+    }
+    @Synchronized
+    private fun advertiseLegacy(cycle: Long = generation) {
         if (!current(cycle) || session.connected != null || advertising != null) return
         try {
             val advertiser = adapter.bluetoothLeAdvertiser ?: return failed(Failure.unsupported)
@@ -139,6 +234,13 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
     }
     @Synchronized
     private fun stopAdvertising() {
+        powerTimer?.cancel(); powerTimer = null
+        val previous = setCallback
+        setCallback = null; advertisingSet = null; changingParameters = false; appliedInterval = 0
+        if (previous != null) {
+            try { adapter.bluetoothLeAdvertiser?.stopAdvertisingSet(previous) }
+            catch (_: SecurityException) { failed(Failure.permissionDenied) }
+        }
         val callback = advertising ?: return
         advertising = null
         try { adapter.bluetoothLeAdvertiser?.stopAdvertising(callback) }
@@ -149,11 +251,13 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
         // A previous session's event must not close a newer connection or handshake.
         if (session.connected != null || (active != null && activeDevice == null)) return
         active?.close(); active = null; activeDevice = null
+        power.disconnected(SystemClock.elapsedRealtime())
         if (running) advertise()
     }
     @Synchronized
     fun stop(): Job? {
         running = false; generation++
+        power.stop(); gattConnections.clear()
         val pending = acceptor
         pending?.cancel(); acceptor = null
         active?.close(); active = null
