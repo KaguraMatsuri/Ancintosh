@@ -24,7 +24,7 @@ struct MainView: View {
                 ScrollView {
                     topology
                         .frame(height: max(geometry.size.height - 32,
-                            max(500, CGFloat((runtime.configuration.peers.count + 3) / 4) * 160 + 240)))
+                            max(564, CGFloat((runtime.configuration.peers.count + 3) / 4) * 160 + 240)))
                         .padding(16)
                 }
             }

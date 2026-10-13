@@ -25,6 +25,8 @@ struct ConnectionTopologyView: View {
     let edit: (UUID) -> Void
     let move: (UUID, Bool) -> Void
     let place: ([UUID: NodePosition]) -> Void
+    private let macHeight: CGFloat = 128
+    private let nodeHeight: CGFloat = 168
     private struct DragSession {
         let id: UUID
         let origin: CGPoint
@@ -49,8 +51,8 @@ struct ConnectionTopologyView: View {
                             let distance = max(1, hypot(dx, dy)), ux = dx / distance, uy = dy / distance
                             let sourceHalfWidth = (sending ? macWidth(size) : nodeWidth(size)) / 2
                             let targetHalfWidth = (sending ? nodeWidth(size) : macWidth(size)) / 2
-                            let sourceHalfHeight: CGFloat = sending ? 48 : 68
-                            let targetHalfHeight: CGFloat = sending ? 68 : 48
+                            let sourceHalfHeight = (sending ? macHeight : nodeHeight) / 2
+                            let targetHalfHeight = (sending ? nodeHeight : macHeight) / 2
                             let sourceMargin = min(sourceHalfWidth / max(0.001, abs(ux)), sourceHalfHeight / max(0.001, abs(uy))) + 2
                             let targetMargin = min(targetHalfWidth / max(0.001, abs(ux)), targetHalfHeight / max(0.001, abs(uy))) + 2
                             let start = CGPoint(x: origin.x + ux * sourceMargin - uy * 4, y: origin.y + uy * sourceMargin + ux * 4)
@@ -85,9 +87,9 @@ struct ConnectionTopologyView: View {
                 }
                 VStack(spacing: 6) {
                     Image(systemName: "laptopcomputer").font(.system(size: 40)).accessibilityHidden(true)
-                    Text(macName).lineLimit(1).help(macName)
+                    Text(macName).lineLimit(3).multilineTextAlignment(.center).help(macName)
                 }
-                .frame(width: macWidth(size), height: 96)
+                .frame(width: macWidth(size), height: macHeight)
                 .background(.background, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary.opacity(0.4)))
                 .overlay(alignment: .topTrailing) {
@@ -114,7 +116,8 @@ struct ConnectionTopologyView: View {
         VStack(spacing: 5) {
             Image(systemName: device.profile.kind == .pad ? "ipad.landscape" : "smartphone")
                 .font(.system(size: 36)).accessibilityHidden(true)
-            Text(device.profile.name ?? device.id.uuidString).lineLimit(1).help(device.profile.name ?? device.id.uuidString)
+            Text(device.profile.name ?? device.id.uuidString).lineLimit(3).multilineTextAlignment(.center)
+                .help(device.profile.name ?? device.id.uuidString)
             Text(device.connected ? "已连接" : "离线").font(.caption)
                 .foregroundStyle(device.connected ? Color.secondary : Color.red)
             if device.connected {
@@ -123,7 +126,7 @@ struct ConnectionTopologyView: View {
             }
             Text("\(device.priority)").font(.caption2).foregroundStyle(.secondary)
         }
-        .frame(width: nodeWidth(size), height: 136)
+        .frame(width: nodeWidth(size), height: nodeHeight)
         .contentShape(Rectangle())
         .gesture(DragGesture(coordinateSpace: .named("topology"))
             .updating($gestureActive) { _, active, transaction in active = true; transaction.disablesAnimations = true }
@@ -174,7 +177,7 @@ struct ConnectionTopologyView: View {
         let index = ids.firstIndex(of: device.id) ?? 0
         let angle = devices.count == 1 ? Double.pi / 2 : Double.pi + Double(index) * 2 * .pi / Double(max(1, devices.count))
         return CGPoint(x: size.width / 2 + cos(angle) * max(0, size.width / 2 - nodeWidth(size) / 2 - 14),
-                       y: size.height / 2 + sin(angle) * max(0, size.height / 2 - 82))
+                       y: size.height / 2 + sin(angle) * max(0, size.height / 2 - nodeHeight / 2 - 14))
     }
     private func point(_ device: TopologyDevice, in size: CGSize) -> CGPoint {
         if let drag, drag.id == device.id { return drag.center }
@@ -186,7 +189,9 @@ struct ConnectionTopologyView: View {
     private func macWidth(_ size: CGSize) -> CGFloat { min(124, max(104, size.width * 0.22)) }
     private func clamp(_ point: CGPoint, _ size: CGSize) -> CGPoint {
         let inset = nodeWidth(size) / 2 + 8
-        return CGPoint(x: min(max(inset, point.x), max(inset, size.width - inset)), y: min(max(76, point.y), max(76, size.height - 76)))
+        let verticalInset = nodeHeight / 2 + 8
+        return CGPoint(x: min(max(inset, point.x), max(inset, size.width - inset)),
+                       y: min(max(verticalInset, point.y), max(verticalInset, size.height - verticalInset)))
     }
     private func saveInitialPositions(_ size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
