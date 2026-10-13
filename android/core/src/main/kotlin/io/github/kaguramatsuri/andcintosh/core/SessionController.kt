@@ -17,6 +17,9 @@ sealed interface SyncEvent {
     data class Failed(val id: UUID, val code: Failure) : SyncEvent
     data class Completed(val id: UUID) : SyncEvent
     data class Offer(val peer: UUID, val context: UUID, val addresses: List<Pair<String, Int>>, val binding: ByteArray) : SyncEvent
+    data class Configuration(val value: ManagedConfiguration, val json: String) : SyncEvent
+    data class ConfigurationRejected(val request: UUID, val code: Failure) : SyncEvent
+    data object ConfigurationReady : SyncEvent
 }
 
 class SessionController(val identity: UUID, private val scope: CoroutineScope, private val store: TransferStore,
@@ -34,12 +37,14 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     private val lastProgress = mutableMapOf<UUID, Long>()
     var wifi = true; private set
     @Volatile private var remoteWifi = true
+    @Volatile private var remoteConfiguration = false
     val connected: UUID? get() = peer
     suspend fun outgoingFiles(): List<OutboundJob> = state.withLock { queue.filter { it.snapshot.manifest.kind == PayloadKind.FILE }.map { it.copy() } }
     suspend fun restore() = state.withLock { queue.addAll(store.restore()) }
 
     suspend fun installBLE(auth: Authentication, channel: EncryptedChannel) {
         ble?.close(); tcp?.close(); tcp = null; ble = channel; peer = auth.peer; offer = null
+        remoteConfiguration = false
         val root = ByteBuffer.wrap(channel.root)
         epoch = UUID(root.long, root.long); awaitingFallback = false
         channel.setDataEpoch(epoch)
@@ -49,7 +54,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             queue.forEach { it.begun = false; it.waiting = false; it.finished = false }
         }
         scope.launch { readLoop(channel, false) }
-        channel.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", wifi).bytes()))
+        channel.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", wifi).put("configuration", true).bytes()))
         events(SyncEvent.Connected(auth.peer)); pump()
     }
     suspend fun installTCP(context: UUID, channel: EncryptedChannel) {
@@ -63,10 +68,13 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     suspend fun wifi(enabled: Boolean) {
         wifi = enabled
         if (!enabled && tcp != null) tcpLost()
-        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", enabled).bytes()))
+        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", enabled).put("configuration", true).bytes()))
         pump()
     }
-    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", true).bytes())) }
+    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", true).put("configuration", true).bytes())) }
+    suspend fun reportDevice(information: DeviceInformation) {
+        if (remoteConfiguration) ble?.send(Record(RecordKind.DEVICE_INFORMATION, metadata = information.json().bytes()))
+    }
     suspend fun tcpLost() {
         val previous = tcp; tcp = null; offer = null; awaitingFallback = true; previous?.close()
         ble?.setDataEpoch(null)
@@ -184,7 +192,8 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     }
     private suspend fun receive(record: Record, channel: EncryptedChannel, isTCP: Boolean) {
         val current = peer ?: return
-        val transfer = record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH, RecordKind.ACK, RecordKind.RESUME, RecordKind.CANCEL, RecordKind.FAILURE)
+        val configurationFailure = record.kind == RecordKind.FAILURE && record.json().optBoolean("configuration", false)
+        val transfer = !configurationFailure && record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH, RecordKind.ACK, RecordKind.RESUME, RecordKind.CANCEL, RecordKind.FAILURE)
         if (transfer && (awaitingFallback || record.epoch != epoch || channel !== (tcp ?: ble))) return
         try {
             when (record.kind) {
@@ -225,6 +234,8 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 RecordKind.WIFI_PREFERENCE -> {
                     if (isTCP) fail(Failure.invalidFrame)
                     remoteWifi = record.json().getBoolean("enabled")
+                    val ready = record.json().optBoolean("configuration", false)
+                    if (ready && !remoteConfiguration) { remoteConfiguration = true; events(SyncEvent.ConfigurationReady) }
                     if (!remoteWifi) tcpLost()
                 }
                 RecordKind.TCP_OFFER -> {
@@ -246,12 +257,24 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 }
                 RecordKind.FAILURE -> {
                     val code = Failure.valueOf(record.json().getString("code"))
+                    if (record.json().optBoolean("configuration", false)) {
+                        if (isTCP) fail(Failure.invalidFrame)
+                        events(SyncEvent.ConfigurationRejected(record.id, code))
+                        return
+                    }
                     val pending = state.withLock {
                         val job = queue.firstOrNull { it.snapshot.manifest.id == record.id } ?: return@withLock false
                         job.failed = code; store.persist(queue); true
                     }
                     if (pending) events(SyncEvent.Failed(record.id, code))
                 }
+                RecordKind.CONFIGURATION -> {
+                    if (isTCP) fail(Failure.invalidFrame)
+                    val value = ManagedConfiguration.decode(record.json())
+                    if (value.mac.id != current) fail(Failure.authenticationFailed)
+                    events(SyncEvent.Configuration(value, record.metadata.toString(Charsets.UTF_8)))
+                }
+                RecordKind.DEVICE_INFORMATION -> fail(Failure.invalidFrame)
             }
         } catch (error: ProtocolException) {
             if (transfer && record.epoch != epoch) return

@@ -22,24 +22,31 @@ public enum Handshake {
 
     public static func authenticate(channel: any ByteChannel, role: PeerRole, identity: UUID,
                                     key: Data, context: UUID = Wire.zeroID, transport: TransportKind,
-                                    expectedPeer: UUID? = nil, remoteHello: Hello? = nil) async throws -> Authentication {
+                                    expectedPeer: UUID? = nil, remoteHello: Hello? = nil,
+                                    traffic: (@Sendable (Bool) -> Void)? = nil) async throws -> Authentication {
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let local = try Hello(role: role, peerID: identity, contextID: context, nonce: Crypto.random(32), publicKey: ephemeral.publicKey.rawRepresentation)
         try await channel.write(local.encoded())
+        traffic?(true)
         let remote: Hello
         if let remoteHello { remote = remoteHello }
         else { remote = try await readHello(channel: channel) }
+        traffic?(false)
         guard remote.role != role, remote.contextID == context,
               expectedPeer == nil || expectedPeer == remote.peerID else { throw ProtocolFailure.authenticationFailed }
         let transcript = Crypto.transcript(local: local, remote: remote, transport: transport)
         try await channel.write(Crypto.proof(key: key, transcript: transcript, role: role))
+        traffic?(true)
         let proof = try await channel.readExactly(32)
+        traffic?(false)
         guard Crypto.verify(proof, key: key, transcript: transcript, role: remote.role) else { throw ProtocolFailure.authenticationFailed }
         let shared = try ephemeral.sharedSecretFromKeyAgreement(with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: remote.publicKey))
         let session = try CryptoSession(key: key, local: local, remote: remote, transport: transport, sharedSecret: shared.withUnsafeBytes { Data($0) })
         let finishedKey = Crypto.derive(session.root, salt: Data(), info: "finished")
         try await channel.write(Crypto.proof(key: finishedKey, transcript: transcript, role: role))
+        traffic?(true)
         let finished = try await channel.readExactly(32)
+        traffic?(false)
         guard Crypto.verify(finished, key: finishedKey, transcript: transcript, role: remote.role) else { throw ProtocolFailure.authenticationFailed }
         return Authentication(peer: remote.peerID, session: session)
     }
@@ -62,9 +69,12 @@ public actor EncryptedChannel {
     private var closed = false
     private var dataEpoch: UUID?
     private var discarded: Set<UUID> = []
+    private let traffic: (@Sendable (Bool) -> Void)?
 
-    public init(raw: any ByteChannel, authentication: Authentication, transport: TransportKind) {
+    public init(raw: any ByteChannel, authentication: Authentication, transport: TransportKind,
+                traffic: (@Sendable (Bool) -> Void)? = nil) {
         self.raw = raw; crypto = authentication.session; root = authentication.session.root; self.transport = transport
+        self.traffic = traffic
     }
 
     public func send(_ record: Record) async throws {
@@ -110,6 +120,7 @@ public actor EncryptedChannel {
             do {
                 if !write.buffered || (write.record.epoch == dataEpoch && !discarded.contains(write.record.transferID)) {
                     try await raw.write(crypto.seal(write.record))
+                    if Self.isControl(write.record.kind) { traffic?(true) }
                 }
                 write.continuation?.resume()
             }
@@ -127,7 +138,15 @@ public actor EncryptedChannel {
         guard length >= 16 + Wire.recordHeaderSize, length <= Wire.maxPlaintext + 16 else { throw ProtocolFailure.invalidFrame }
         var frame = header
         frame.append(try await raw.readExactly(Int(length)))
-        return try crypto.open(frame)
+        let record = try crypto.open(frame)
+        if Self.isControl(record.kind) { traffic?(false) }
+        return record
+    }
+    private static func isControl(_ kind: RecordKind) -> Bool {
+        switch kind {
+        case .begin, .data, .finish, .acknowledge, .resume: false
+        default: true
+        }
     }
 
     public func close() async {

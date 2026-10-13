@@ -13,7 +13,7 @@ enum class Role(val wire: Int) { MAC(1), ANDROID(2) }
 enum class Transport { ble, tcp }
 enum class PayloadKind(val wire: Int) { TEXT(1), IMAGE(2), FILE(3) }
 enum class RecordKind(val wire: Int) {
-    BEGIN(1), DATA(2), FINISH(3), ACK(4), RESUME(5), CANCEL(6), WIFI_PREFERENCE(7), TCP_OFFER(8), GOODBYE(9), FAILURE(10), TRANSPORT_SWITCH(11)
+    BEGIN(1), DATA(2), FINISH(3), ACK(4), RESUME(5), CANCEL(6), WIFI_PREFERENCE(7), TCP_OFFER(8), GOODBYE(9), FAILURE(10), TRANSPORT_SWITCH(11), DEVICE_INFORMATION(12), CONFIGURATION(13)
 }
 object Wire {
     val MAGIC = "Ciallo~".toByteArray(Charsets.US_ASCII)

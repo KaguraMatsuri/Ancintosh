@@ -24,6 +24,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     val identity: String = settings.identity.toString()
     var mac by mutableStateOf(settings.mac?.toString()); private set
     var wifi by mutableStateOf(settings.wifi); private set
+    var name by mutableStateOf(settings.name)
+    var macName by mutableStateOf(settings.macName); private set
+    private var previousName = settings.name
     var key by mutableStateOf("")
     var hasKey by mutableStateOf(settings.hasKey); private set
     var originalPermissionNeeded by mutableStateOf(settings.originalPermissionNeeded); private set
@@ -36,6 +39,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private var observer: Job? = null
 
     fun refresh() {
+        refreshNames()
         originalPermissionNeeded = settings.originalPermissionNeeded
         hasKey = settings.hasKey; mac = settings.mac?.toString()
         if (service == null && !busy) viewModelScope.launch { attach(false) }
@@ -50,6 +54,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             val connected = handle.connect(); service = connected
             observer = viewModelScope.launch {
                 connected.status.collect {
+                    refreshNames()
                     mutableStatus.value = it; mac = settings.mac?.toString()
                     originalPermissionNeeded = settings.originalPermissionNeeded
                 }
@@ -59,6 +64,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             if (reportFailure) this.error = failureText(error)
         }
     }
+    private fun refreshNames() {
+        if (name == previousName) name = settings.name
+        previousName = settings.name; macName = settings.macName
+    }
+    fun saveName() = operation {
+        val candidate = name
+        withContext(Dispatchers.IO) { settings.rename(candidate); service?.reportDevice() }
+        name = settings.name; previousName = name
+    }
+    fun cancelName() { name = settings.name; previousName = settings.name }
     fun start() = operation {
         withContext(Dispatchers.IO) { settings.loadKey() }
         ContextCompat.startForegroundService(context, Intent(context, SyncService::class.java))

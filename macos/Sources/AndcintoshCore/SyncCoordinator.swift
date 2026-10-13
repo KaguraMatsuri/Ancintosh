@@ -9,11 +9,22 @@ public enum SyncEvent: Sendable {
     case wifiChanged(UUID, Bool)
     case completed(UUID, UUID)
     case transportChanged(UUID, TransportKind?)
+    case deviceInformation(UUID, DeviceInformation)
+    case transferStarted(UUID, TransferManifest, sending: Bool)
+    case transferStopped(UUID, UUID)
 }
 
-private struct Preference: Codable { let enabled: Bool }
+private struct Preference: Codable {
+    let enabled: Bool
+    let configuration: Bool?
+    init(enabled: Bool, configuration: Bool? = true) { self.enabled = enabled; self.configuration = configuration }
+}
 private struct Acknowledgement: Codable { let complete: Bool }
-private struct FailureMessage: Codable { let code: ProtocolFailure }
+private struct FailureMessage: Codable {
+    let code: ProtocolFailure
+    let configuration: Bool?
+    init(code: ProtocolFailure, configuration: Bool? = nil) { self.code = code; self.configuration = configuration }
+}
 private struct SwitchMessage: Codable { let transport: TransportKind }
 private struct PeerChannels {
     let ble: EncryptedChannel
@@ -24,6 +35,7 @@ private struct PeerChannels {
     var offer: TCPOffer?
     var epoch = Wire.zeroID
     var switching = false
+    var supportsConfiguration = false
 }
 
 public actor SyncCoordinator {
@@ -58,6 +70,12 @@ public actor SyncCoordinator {
     public func permitsWifi(_ peer: UUID) -> Bool {
         guard let entry = peers[peer] else { return false }
         return localWifi && entry.route.remoteWifi
+    }
+
+    public func sendConfiguration(_ value: ManagedConfiguration, to peer: UUID) async throws {
+        guard role == .mac, let entry = peers[peer], entry.supportsConfiguration else { throw ProtocolFailure.peerUnavailable }
+        let channel = entry.ble
+        try await channel.send(Record(.configuration, metadata: Wire.encodeJSON(value)))
     }
 
     public func installBLE(_ peer: UUID, channel: EncryptedChannel) async throws {
@@ -178,6 +196,7 @@ public actor SyncCoordinator {
         if cancelsActive { activeCancelled.insert(peer) }
         let previous = scheduler.jobs.first(where: { $0.peer == peer && $0.manifest.id == id })?.snapshot ?? (cancelsActive ? activeSources[peer] : nil)
         scheduler.remove(id, peer: peer)
+        try? await events(.transferStopped(peer, id))
         try? await store.persistOutgoing(scheduler.jobs)
         if let channel = dataChannel(peer), let epoch = peers[peer]?.epoch {
             await channel.discardBuffered(id)
@@ -222,6 +241,7 @@ public actor SyncCoordinator {
                 let manifest = try Wire.decodeJSON(TransferManifest.self, record.metadata)
                 guard manifest.id == record.transferID else { throw ProtocolFailure.invalidManifest }
                 let offset = try await store.begin(manifest, peer: peer, epoch: record.epoch)
+                try await events(.transferStarted(peer, manifest, sending: false))
                 try await channel.send(Record(.resume, transferID: manifest.id, offset: offset, epoch: record.epoch))
             case .data:
                 if let durable = try await store.append(peer: peer, id: record.transferID, offset: record.offset, bytes: record.bytes, epoch: record.epoch) {
@@ -235,7 +255,10 @@ public actor SyncCoordinator {
                     try await store.delivered(peer: peer, id: manifest.id)
                     if manifest.kind != .file { currentClipboard = url }
                     if role == .mac && manifest.kind != .file {
-                        scheduler.jobs.filter { $0.manifest.kind != .file }.forEach { scheduler.remove($0.manifest.id, peer: $0.peer) }
+                        for job in scheduler.jobs where job.manifest.kind != .file {
+                            scheduler.remove(job.manifest.id, peer: job.peer)
+                            try await events(.transferStopped(job.peer, job.manifest.id))
+                        }
                         let snapshot = Snapshot(manifest: manifest, url: url)
                         for target in peers.keys where target != peer {
                             scheduler.enqueue(OutboundJob(peer: target, manifest: manifest, snapshot: snapshot.url, userInitiated: true))
@@ -244,6 +267,7 @@ public actor SyncCoordinator {
                 }
                 try await channel.send(Record(.acknowledge, transferID: manifest.id, offset: manifest.size,
                                               metadata: Wire.encodeJSON(Acknowledgement(complete: true)), epoch: record.epoch))
+                try await events(.transferStopped(peer, manifest.id))
             case .resume:
                 try scheduler.resume(record.transferID, peer: peer, offset: record.offset)
             case .acknowledge:
@@ -261,6 +285,7 @@ public actor SyncCoordinator {
                     }
                 }
             case .cancel:
+                try await events(.transferStopped(peer, record.transferID))
                 if activeJobs[peer] == record.transferID { activeCancelled.insert(peer) }
                 scheduler.remove(record.transferID, peer: peer)
                 await store.cancel(peer: peer, id: record.transferID)
@@ -310,6 +335,18 @@ public actor SyncCoordinator {
                 scheduler.fail(record.transferID, peer: peer, error: failure.code)
                 try await store.persistOutgoing(scheduler.jobs)
                 try await events(.failed(peer, record.transferID, failure.code))
+            case .deviceInformation:
+                guard role == .mac, !tcp else { throw ProtocolFailure.invalidFrame }
+                let information = try Wire.decodeJSON(DeviceInformation.self, record.metadata)
+                guard information.kind != .mac else { throw ProtocolFailure.invalidFrame }
+                peers[peer]?.supportsConfiguration = true
+                do { try await events(.deviceInformation(peer, information)) }
+                catch let failure as ProtocolFailure {
+                    try await channel.send(Record(.failure, transferID: information.renameRequest ?? Wire.zeroID,
+                        metadata: Wire.encodeJSON(FailureMessage(code: failure, configuration: true))))
+                }
+            case .configuration:
+                throw ProtocolFailure.invalidFrame
             }
         } catch let failure as ProtocolFailure {
             if isTransfer && record.epoch != peers[peer]?.epoch { return }
@@ -406,6 +443,7 @@ public actor SyncCoordinator {
             guard let epoch = peers[job.peer]?.epoch else { scheduler.requeue(job); return }
             do {
                 if !job.begun {
+                    try await events(.transferStarted(peer, job.manifest, sending: true))
                     job.begun = true; job.waitingForResume = true
                     scheduler.requeue(job)
                     try await channel.send(Record(.begin, transferID: job.manifest.id, metadata: Wire.encodeJSON(job.manifest), epoch: epoch))

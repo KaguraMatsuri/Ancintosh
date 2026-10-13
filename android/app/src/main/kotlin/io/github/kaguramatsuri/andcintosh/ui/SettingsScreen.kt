@@ -43,12 +43,21 @@ fun SettingsScreen(model: SettingsViewModel, start: () -> Unit, sendFiles: () ->
                         Text(stringResource(R.string.device_id), style = MaterialTheme.typography.labelLarge)
                         Text(model.identity)
                         Text(stringResource(R.string.mac_id), style = MaterialTheme.typography.labelLarge)
+                        model.macName?.let { Text(it) }
                         Text(model.mac ?: stringResource(R.string.not_paired))
                     }
                 }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (state.running) Button(onClick = model::stop, enabled = !model.busy) { Text(stringResource(R.string.stop)) }
                     else Button(onClick = start, enabled = !model.busy && model.hasKey) { Text(stringResource(R.string.start)) }
+                }
+            }
+            item {
+                OutlinedTextField(value = model.name, onValueChange = { model.name = it }, label = { Text(stringResource(R.string.device_name)) },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !model.busy)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = model::saveName, enabled = !model.busy) { Text(stringResource(R.string.save)) }
+                    TextButton(onClick = model::cancelName, enabled = !model.busy) { Text(stringResource(R.string.cancel)) }
                 }
             }
             item {

@@ -1,3 +1,4 @@
+import AndcintoshCore
 import AndcintoshPlatform
 import AppKit
 import SwiftUI
@@ -45,6 +46,18 @@ private struct RuntimeMenu: View {
     var body: some View {
         if let runtime {
             Text(runtime.connected.isEmpty ? "未连接" : "已连接 \(runtime.connected.count) 台设备")
+            ForEach(runtime.configuration.peers) { profile in
+                Section(profile.name ?? profile.id.uuidString) {
+                    if let peer = profile.identity, runtime.connected.contains(peer) {
+                        Text("已连接")
+                        Text(runtime.switching.contains(peer) ? "切换中" : (runtime.routes[peer] == .tcp ? "局域网传输" : "蓝牙传输"))
+                        Text("AES-256-GCM · 前向保密")
+                    } else { Text("未连接") }
+                    if let failure = runtime.failures[profile.id] ?? profile.identity.flatMap({ runtime.failures[$0] }) {
+                        Text(Copy.failure(failure))
+                    }
+                }
+            }
         }
         Button("打开 Andcintosh") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
         if let runtime, runtime.running {

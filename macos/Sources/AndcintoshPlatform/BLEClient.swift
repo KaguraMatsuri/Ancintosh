@@ -18,6 +18,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     public var discovered: ((BLEPeer) -> Void)?
     public var failed: ((UUID, ProtocolFailure) -> Void)?
     public var associated: ((UUID, UUID) -> Void)?
+    public var signal: (@MainActor @Sendable (UUID, ConnectionSignal) -> Void)?
     private var central: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var keys: [UUID: Data] = [:]
@@ -221,18 +222,26 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         let expected = identities[device]
         let identity = self.identity
         let coordinator = self.coordinator
+        let handshakeToken = UUID()
+        signal?(device, .handshakeStarted(handshakeToken))
+        let packet: @Sendable (Bool, Bool) -> Void = { [weak self] sending, handshake in
+            Task { @MainActor in
+                guard let self, !self.stopped, self.lifecycle.isCurrent(device, token: token) else { return }
+                self.signal?(device, .packet(sending: sending, handshake: handshake))
+            }
+        }
         handshakes[device] = Task { [weak self, weak peripheral] in
             let timeout = Task { try? await Task.sleep(for: .seconds(5)); if !Task.isCancelled { await raw.close() } }
-            defer { timeout.cancel() }
+            defer { timeout.cancel(); self?.signal?(device, .handshakeEnded(handshakeToken)) }
             do {
                 let auth = try await Handshake.authenticate(channel: raw, role: .mac, identity: identity, key: key,
-                                                            transport: .ble, expectedPeer: expected)
+                                                            transport: .ble, expectedPeer: expected, traffic: { packet($0, true) })
                 timeout.cancel()
                 try Task.checkCancellation()
                 guard let self, !self.stopped, self.lifecycle.authenticated(device, token: token) else { await raw.close(); return }
                 self.identities[device] = auth.peer
                 self.associated?(device, auth.peer)
-                try await coordinator.installBLE(auth.peer, channel: EncryptedChannel(raw: raw, authentication: auth, transport: .ble))
+                try await coordinator.installBLE(auth.peer, channel: EncryptedChannel(raw: raw, authentication: auth, transport: .ble, traffic: { packet($0, false) }))
                 guard self.lifecycle.isCurrent(device, token: token) else { return }
                 self.channels.removeValue(forKey: device)
                 self.handshakes.removeValue(forKey: device)

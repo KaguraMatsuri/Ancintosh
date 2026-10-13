@@ -1,0 +1,29 @@
+{
+  "report": {
+    "name": "Pad",
+    "kind": "pad",
+    "wifi": false,
+    "renameRequest": "00000000-0000-0000-0000-000000000002"
+  },
+  "configuration": {
+    "revision": 7,
+    "mac": {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "name": "Mac",
+      "kind": "mac",
+      "wifi": true,
+      "priority": 0
+    },
+    "device": {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "name": "Pad",
+      "kind": "pad",
+      "wifi": false,
+      "priority": 1,
+      "renameRequest": "00000000-0000-0000-0000-000000000002"
+    },
+    "primary": "00000000-0000-0000-0000-000000000002",
+    "lockEnabled": false,
+    "lockDelaySeconds": 30
+  }
+}

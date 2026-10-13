@@ -5,6 +5,7 @@
     <string name="wifi">wifi传输</string>
     <string name="connection">连接</string>
     <string name="device_id">本机标识</string>
+    <string name="device_name">设备名称</string>
     <string name="mac_id">已验证的 Mac</string>
     <string name="not_paired">尚未配对</string>
     <string name="waiting">等待 Mac 连接</string>

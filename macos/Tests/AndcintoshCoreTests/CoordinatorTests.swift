@@ -44,13 +44,18 @@ private actor EventRecorder {
     var sent: UInt64 = 0
     var errors: [ProtocolFailure] = []
     var routes: [UUID: TransportKind] = [:]
+    var information: [UUID: DeviceInformation] = [:]
+    var active: Set<String> = []
     func record(_ event: SyncEvent) {
         switch event {
-        case .completed(_, let id): complete.insert(id)
-        case .received(_, let manifest, let file): received[manifest.id] = file
+        case .completed(let peer, let id): complete.insert(id); active.remove("\(peer)/\(id)/true")
+        case .received(let peer, let manifest, let file): received[manifest.id] = file; active.remove("\(peer)/\(manifest.id)/false")
         case .transportChanged(let peer, let route): routes[peer] = route
         case .progress(_, _, let offset, _): sent = offset
         case .failed(_, _, let error): errors.append(error)
+        case .deviceInformation(let peer, let value): information[peer] = value
+        case .transferStarted(let peer, let manifest, let sending): active.insert("\(peer)/\(manifest.id)/\(sending)")
+        case .transferStopped(let peer, let id): active.remove("\(peer)/\(id)/true"); active.remove("\(peer)/\(id)/false")
         default: break
         }
     }
@@ -100,6 +105,7 @@ private actor EventRecorder {
     #expect(delivered != nil)
     if let delivered { #expect(try Data(contentsOf: delivered) == bytes) }
     #expect(await events.complete.contains(snapshot.manifest.id))
+    #expect(await events.active.isEmpty)
     let errors = await events.errors
     #expect(errors.isEmpty)
     await left.stop(); await right.stop()
@@ -180,4 +186,71 @@ private actor EventRecorder {
     #expect(await left.connectedPeers().contains(phone))
     #expect(await right.connectedPeers().contains(mac))
     await left.stop(); await right.stop()
+}
+
+@Test func configurationReportsStayOnBluetoothAfterTCPUpgrade() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let mac = UUID(), phone = UUID(), key = Data(repeating: 4, count: 32), events = EventRecorder()
+    let store = try TransferStore(root: root, downloads: root.appendingPathComponent("downloads"))
+    let coordinator = SyncCoordinator(identity: mac, role: .mac, store: store) { await events.record($0) }
+    let (a,b) = pair()
+    async let aa = Handshake.authenticate(channel: a, role: .mac, identity: mac, key: key, transport: .ble)
+    async let bb = Handshake.authenticate(channel: b, role: .android, identity: phone, key: key, transport: .ble)
+    let (left,right) = try await (aa,bb)
+    let remoteBLE = EncryptedChannel(raw: b, authentication: right, transport: .ble)
+    try await coordinator.installBLE(phone, channel: EncryptedChannel(raw: a, authentication: left, transport: .ble))
+    #expect(try await remoteBLE.receive().kind == .wifiPreference)
+    let report = DeviceInformation(name: "Pad", kind: .pad, wifi: true, renameRequest: UUID())
+    try await remoteBLE.send(Record(.deviceInformation, metadata: Wire.encodeJSON(report)))
+    for _ in 0..<100 { if await events.information[phone] != nil { break }; try await Task.sleep(for: .milliseconds(5)) }
+    #expect(await events.information[phone]?.name == "Pad")
+    let offer = try await coordinator.offerTCP(phone, addresses: [TCPAddress(host: "192.0.2.1", port: 12345)])
+    #expect(try await remoteBLE.receive().kind == .tcpOffer)
+    let binding = try await coordinator.bindingKey(peer: phone, context: offer.id), (c,d) = pair()
+    async let cc = Handshake.authenticate(channel: c, role: .mac, identity: mac, key: binding, context: offer.id, transport: .tcp)
+    async let dd = Handshake.authenticate(channel: d, role: .android, identity: phone, key: binding, context: offer.id, transport: .tcp)
+    let (tcpLeft,tcpRight) = try await (cc,dd)
+    let remoteTCP = EncryptedChannel(raw: d, authentication: tcpRight, transport: .tcp)
+    try await coordinator.installTCP(phone, channel: EncryptedChannel(raw: c, authentication: tcpLeft, transport: .tcp), context: offer.id)
+    let value = ManagedConfiguration(revision: 1, mac: ManagedDevice(id: mac, name: "Mac", kind: .mac, wifi: true, priority: 0),
+        device: nil, primary: phone, lockEnabled: false, lockDelaySeconds: 15)
+    try await coordinator.sendConfiguration(value, to: phone)
+    let update = try await remoteBLE.receive()
+    #expect(update.kind == .configuration)
+    #expect(try Wire.decodeJSON(ManagedConfiguration.self, update.metadata).revision == 1)
+    let forbidden = DeviceInformation(name: "TCP must not rename", kind: .phone, wifi: true)
+    try await remoteTCP.send(Record(.deviceInformation, metadata: Wire.encodeJSON(forbidden)))
+    for _ in 0..<100 { if await !coordinator.usingTCP(phone) { break }; try await Task.sleep(for: .milliseconds(5)) }
+    #expect(await !coordinator.usingTCP(phone))
+    #expect(await events.information[phone]?.name == "Pad")
+    await coordinator.stop(); await remoteBLE.close(); await remoteTCP.close()
+}
+
+private final class PacketCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outbound = 0, inbound = 0
+    func packet(_ sending: Bool) { lock.withLock { if sending { outbound += 1 } else { inbound += 1 } } }
+    var counts: (Int,Int) { lock.withLock { (outbound,inbound) } }
+}
+
+@Test func trafficObservesLogicalHandshakeMessagesAndSkipsBulkRecords() async throws {
+    let (a,b) = pair(), mac = UUID(), phone = UUID(), key = Data(repeating: 4, count: 32)
+    let macEvents = PacketCounter(), phoneEvents = PacketCounter()
+    async let aa = Handshake.authenticate(channel: a, role: .mac, identity: mac, key: key, transport: .ble, traffic: { macEvents.packet($0) })
+    async let bb = Handshake.authenticate(channel: b, role: .android, identity: phone, key: key, transport: .ble, traffic: { phoneEvents.packet($0) })
+    let (left,right) = try await (aa,bb)
+    #expect(macEvents.counts == (3,3) && phoneEvents.counts == (3,3))
+    let tx = PacketCounter(), rx = PacketCounter()
+    let first = EncryptedChannel(raw: a, authentication: left, transport: .ble, traffic: { tx.packet($0) })
+    let second = EncryptedChannel(raw: b, authentication: right, transport: .ble, traffic: { rx.packet($0) })
+    for kind in [RecordKind.data, .acknowledge, .begin, .resume, .finish] {
+        try await first.send(Record(kind, bytes: kind == .data ? Data([1]) : Data()))
+        #expect(try await second.receive().kind == kind)
+    }
+    #expect(tx.counts == (0,0) && rx.counts == (0,0))
+    try await first.send(Record(.wifiPreference, metadata: Data("{\"enabled\":true}".utf8)))
+    #expect(try await second.receive().kind == .wifiPreference)
+    #expect(tx.counts == (1,0) && rx.counts == (0,1))
+    await first.close(); await second.close()
 }

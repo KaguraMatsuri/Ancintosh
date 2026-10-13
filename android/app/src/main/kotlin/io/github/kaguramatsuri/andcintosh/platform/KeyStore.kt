@@ -4,6 +4,13 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.os.Build
+import io.github.kaguramatsuri.andcintosh.core.ManagedConfiguration
+import io.github.kaguramatsuri.andcintosh.core.DeviceInformation
+import io.github.kaguramatsuri.andcintosh.core.DeviceKind
+import io.github.kaguramatsuri.andcintosh.core.Record
+import io.github.kaguramatsuri.andcintosh.core.RecordKind
+import org.json.JSONObject
 import io.github.kaguramatsuri.andcintosh.core.Crypto
 import io.github.kaguramatsuri.andcintosh.core.Failure
 import io.github.kaguramatsuri.andcintosh.core.fail
@@ -15,7 +22,46 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 class DeviceSettings(context: Context) {
+    companion object { private val configurationLock = Any() }
     private val prefs = context.getSharedPreferences("andcintosh", Context.MODE_PRIVATE)
+    val name: String get() = prefs.getString("pendingName", null) ?: prefs.getString("name", null) ?: Build.MODEL
+    val renameRequest: UUID? get() = prefs.getString("renameRequest", null)?.let(UUID::fromString)
+    val macName: String? get() = prefs.getString("macName", null)
+    fun information(kind: DeviceKind): DeviceInformation = synchronized(configurationLock) {
+        DeviceInformation(name, kind, wifi, renameRequest)
+    }
+    @android.annotation.SuppressLint("UseKtx")
+    fun rejectRename(request: UUID): Unit = synchronized(configurationLock) {
+        if (renameRequest == request && !prefs.edit().remove("pendingName").remove("renameRequest").commit()) fail(Failure.permissionDenied)
+    }
+    // Check the durable commit result before sending the request over BLE.
+    @android.annotation.SuppressLint("UseKtx")
+    fun rename(name: String): Unit = synchronized(configurationLock) {
+        val candidate = name.ifEmpty { Build.MODEL }
+        // Use the existing frame bound before creating a durable request.
+        Record(RecordKind.DEVICE_INFORMATION, metadata = DeviceInformation(candidate,
+            DeviceKind.phone, wifi, UUID.randomUUID()).json().toString().toByteArray()).encode()
+        if (!prefs.edit().putString("pendingName", candidate).putString("renameRequest", UUID.randomUUID().toString()).commit()) fail(Failure.permissionDenied)
+    }
+    fun applyConfiguration(value: ManagedConfiguration, json: String): Unit = synchronized(configurationLock) {
+        val editor = prefs.edit()
+        if (value.revision >= prefs.getLong("configurationRevision", -1)) {
+            editor.putLong("configurationRevision", value.revision).putString("macName", value.mac.name)
+                .putString("configuration", json)
+        }
+        value.device?.let { device ->
+            val storage = "device.${device.id}"
+            val previous = prefs.getString(storage, null)?.let { JSONObject(it).getLong("revision") } ?: -1
+            if (value.revision >= previous) {
+                editor.putString(storage, json)
+                if (device.id == identity) editor.putString("name", device.name)
+            }
+            if (device.id == identity && renameRequest != null && device.renameRequest == renameRequest) {
+                editor.remove("pendingName").remove("renameRequest")
+            }
+        }
+        if (!editor.commit()) fail(Failure.permissionDenied)
+    }
     val identity: UUID by lazy {
         prefs.getString("identity", null)?.let { UUID.fromString(it) }
             ?: UUID.randomUUID().also { prefs.edit().putString("identity", it.toString()).commit() }

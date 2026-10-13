@@ -9,7 +9,16 @@ public struct PeerProfile: Codable, Sendable, Identifiable {
     public var id: UUID
     public var identity: UUID?
     public var name: String?
+    public var kind: DeviceKind?
+    public var wifi: Bool?
+    public var renameRequest: UUID?
     public init(id: UUID, identity: UUID? = nil, name: String? = nil) { self.id = id; self.identity = identity; self.name = name }
+}
+
+public struct NodePosition: Codable, Sendable, Equatable {
+    public let x: Double
+    public let y: Double
+    public init(x: Double, y: Double) { self.x = x; self.y = y }
 }
 
 public struct MacConfiguration: Codable, Sendable {
@@ -19,8 +28,11 @@ public struct MacConfiguration: Codable, Sendable {
     public var lockEnabled = false
     public var wifi = true
     public var lockDelaySeconds = 15
+    public var nodePositions: [String: NodePosition] = [:]
+    public var name = "Mac"
+    public var revision: Int64 = 0
     public init() {}
-    private enum CodingKeys: String, CodingKey { case identity, peers, primary, lockEnabled, wifi, lockDelaySeconds }
+    private enum CodingKeys: String, CodingKey { case identity, peers, primary, lockEnabled, wifi, lockDelaySeconds, nodePositions, name, revision }
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         identity = try values.decode(UUID.self, forKey: .identity)
@@ -29,10 +41,20 @@ public struct MacConfiguration: Codable, Sendable {
         lockEnabled = try values.decode(Bool.self, forKey: .lockEnabled)
         wifi = try values.decode(Bool.self, forKey: .wifi)
         lockDelaySeconds = try values.decodeIfPresent(Int.self, forKey: .lockDelaySeconds) ?? 15
-        guard (1...3600).contains(lockDelaySeconds) else {
+        nodePositions = try values.decodeIfPresent([String: NodePosition].self, forKey: .nodePositions) ?? [:]
+        name = try values.decodeIfPresent(String.self, forKey: .name) ?? "Mac"
+        revision = try values.decodeIfPresent(Int64.self, forKey: .revision) ?? 0
+        guard (1...3600).contains(lockDelaySeconds), revision >= 0 else {
             throw DecodingError.dataCorruptedError(forKey: .lockDelaySeconds, in: values, debugDescription: "invalidLockDelay")
         }
     }
+}
+
+public struct LinkActivity: Sendable {
+    public let id: UUID
+    public let kind: PayloadKind
+    public let sending: Bool
+    public init(id: UUID, kind: PayloadKind, sending: Bool) { self.id = id; self.kind = kind; self.sending = sending }
 }
 
 public struct MacTransfer: Identifiable, Sendable {
@@ -51,6 +73,8 @@ public final class MacRuntime {
     public private(set) var connected: Set<UUID> = []
     public private(set) var routes: [UUID: TransportKind] = [:]
     public private(set) var switching: Set<UUID> = []
+    public private(set) var activities: [UUID: [LinkActivity]] = [:]
+    public let packetTraffic = ConnectionTraffic()
     public private(set) var progress: [UUID: (UInt64, UInt64)] = [:]
     public private(set) var failures: [UUID: ProtocolFailure] = [:]
     public private(set) var preparing = false
@@ -67,6 +91,10 @@ public final class MacRuntime {
     private var restored = false
     private var lan = false
     private var offers: [UUID: Task<Void, Never>] = [:]
+    private var configurationWrites: [UUID: [UUID: ManagedConfiguration]] = [:]
+    private var configurationWorkers: [UUID: Task<Void, Never>] = [:]
+    private var configurationGenerations: [UUID: UUID] = [:]
+    private var configurationReady: Set<UUID> = []
     private var observation: [NSObjectProtocol] = []
     private struct ClipboardRequest {
         let file: URL?
@@ -82,15 +110,18 @@ public final class MacRuntime {
     @ObservationIgnored private lazy var coordinator = SyncCoordinator(identity: configuration.identity, role: .mac, store: store) { [weak self] event in
         try await self?.event(event)
     }
-    @ObservationIgnored private lazy var server = TCPServer(identity: configuration.identity, coordinator: coordinator)
+    @ObservationIgnored private lazy var server = TCPServer(identity: configuration.identity, coordinator: coordinator) { [weak self] peer, event in
+        await self?.wireSignal(peer, event, logical: true)
+    }
     @ObservationIgnored private lazy var bluetooth: BLEClient = {
         let client = BLEClient(identity: configuration.identity, coordinator: coordinator)
         client.discovered = { [weak self] peer in self?.discovered[peer.identifier] = peer }
         client.failed = { [weak self] id, failure in self?.failures[id] = failure }
+        client.signal = { [weak self] id, event in self?.wireSignal(id, event, logical: false) }
         client.associated = { [weak self] id, identity in
             guard let self, let index = self.configuration.peers.firstIndex(where: { $0.id == id }) else { return }
             self.configuration.peers[index].identity = identity
-            self.persist(); self.configureLock()
+            self.configurationChanged(); self.configureLock()
         }
         return client
     }()
@@ -154,7 +185,62 @@ public final class MacRuntime {
         var remaining = configuration.peers.enumerated().filter { !offsets.contains($0.offset) }.map(\.element)
         remaining.insert(contentsOf: moved, at: destination - offsets.filter { $0 < destination }.count)
         configuration.peers = remaining
-        persist()
+        configurationChanged()
+    }
+    public func renameMac(_ name: String) throws {
+        try validateName(name.isEmpty ? "Mac" : name, mac: true)
+        configuration.name = name.isEmpty ? "Mac" : name
+        configurationChanged(devices: [])
+    }
+    public func renamePeer(_ id: UUID, name: String) throws {
+        guard let index = configuration.peers.firstIndex(where: { $0.id == id }) else { throw ProtocolFailure.peerUnavailable }
+        try validateName(name, mac: false, profile: configuration.peers[index])
+        configuration.peers[index].name = name.isEmpty ? nil : name
+        configurationChanged(devices: configuration.peers[index].identity.map { [$0] })
+    }
+    private func validateName(_ name: String, mac: Bool, profile: PeerProfile? = nil) throws {
+        let owner = ManagedDevice(id: configuration.identity, name: mac ? name : configuration.name, kind: .mac, wifi: false, priority: 0)
+        let profiles = mac ? configuration.peers : profile.map { [$0] } ?? []
+        var devices: [ManagedDevice?] = [nil]
+        devices += profiles.map { ManagedDevice(id: $0.identity ?? $0.id, name: mac ? ($0.name ?? $0.id.uuidString) : name,
+            kind: .phone, wifi: false, priority: Int(Int32.max), renameRequest: $0.renameRequest ?? Wire.zeroID) }
+        for device in devices {
+            let value = ManagedConfiguration(revision: Int64.max, mac: owner, device: device, primary: configuration.primary ?? Wire.zeroID,
+                lockEnabled: false, lockDelaySeconds: 3600)
+            _ = try Record(.configuration, metadata: Wire.encodeJSON(value)).encoded()
+        }
+    }
+    func acceptDeviceInformation(_ peer: UUID, _ value: DeviceInformation) throws {
+        guard value.kind != .mac, let index = configuration.peers.firstIndex(where: { $0.identity == peer }) else { return }
+        let previous = configuration.peers[index]
+        if let request = value.renameRequest, previous.renameRequest != request {
+            try validateName(value.name, mac: false, profile: previous)
+            configuration.peers[index].name = value.name.isEmpty ? nil : value.name
+            configuration.peers[index].renameRequest = request
+        } else if previous.name == nil && value.renameRequest == nil {
+            try validateName(value.name, mac: false, profile: previous)
+            configuration.peers[index].name = value.name.isEmpty ? nil : value.name
+        }
+        let firstReport = configurationReady.insert(peer).inserted
+        configuration.peers[index].kind = value.kind
+        configuration.peers[index].wifi = value.wifi
+        let updated = configuration.peers[index]
+        if updated.name != previous.name || updated.kind != previous.kind || updated.wifi != previous.wifi || updated.renameRequest != previous.renameRequest {
+            configurationChanged(devices: [peer])
+        } else { synchronizeConfiguration(targets: [peer], devices: [peer]) }
+        if firstReport { synchronizeConfiguration(targets: [peer]) }
+    }
+    public func placeNodes(_ positions: [UUID: NodePosition]) {
+        let registered = Set(configuration.peers.map(\.id))
+        var changed = false
+        for (id, position) in positions where registered.contains(id) && position.x.isFinite && position.y.isFinite {
+            let clamped = NodePosition(x: min(1, max(0, position.x)), y: min(1, max(0, position.y)))
+            if configuration.nodePositions[id.uuidString] != clamped {
+                configuration.nodePositions[id.uuidString] = clamped
+                changed = true
+            }
+        }
+        if changed { persist() }
     }
     public func refreshPermissions() { clipboardAllowed = pasteboard.permitted; lockAllowed = locker.permitted }
     public func scan() { start(); discovered.removeAll(); bluetooth.scan() }
@@ -163,9 +249,14 @@ public final class MacRuntime {
         start()
         if let existing = configuration.peers.first(where: { $0.id == profile.id }), let peer = existing.identity { await coordinator.stop(peer) }
         try KeychainStore.save(bytes, peer: profile.id)
-        if let index = configuration.peers.firstIndex(where: { $0.id == profile.id }) { configuration.peers[index] = profile }
+        if let index = configuration.peers.firstIndex(where: { $0.id == profile.id }) {
+            var updated = profile
+            updated.kind = configuration.peers[index].kind; updated.wifi = configuration.peers[index].wifi
+            updated.renameRequest = configuration.peers[index].renameRequest
+            configuration.peers[index] = updated
+        }
         else { configuration.peers.append(profile) }
-        persist()
+        configurationChanged()
         try bluetooth.connect(identifier: profile.id, key: bytes, expectedIdentity: profile.identity)
     }
     public func connect(_ profile: PeerProfile) throws {
@@ -175,7 +266,7 @@ public final class MacRuntime {
         try bluetooth.connect(identifier: profile.id, key: KeychainStore.load(peer: profile.id), expectedIdentity: profile.identity)
     }
     public func wifi(_ enabled: Bool) async {
-        configuration.wifi = enabled; persist()
+        configuration.wifi = enabled; configurationChanged(devices: [])
         await coordinator.wifi(enabled && lan)
         if enabled && lan { for peer in connected { scheduleOffer(peer) } }
         else { for task in offers.values { task.cancel() }; offers.removeAll(); await server.stop() }
@@ -184,13 +275,13 @@ public final class MacRuntime {
         let identity = configuration.peers.first(where: { $0.id == primary })?.identity
         try locker.setDelay(seconds: configuration.lockDelaySeconds)
         try locker.configure(enabled: enabled, primary: identity)
-        configuration.lockEnabled = enabled; configuration.primary = primary; persist()
+        configuration.lockEnabled = enabled; configuration.primary = primary; configurationChanged(devices: [])
         if let identity, connected.contains(identity) { locker.connected(identity) }
     }
     public func saveLockDelay(seconds: Int) throws {
         try locker.setDelay(seconds: seconds)
         configuration.lockDelaySeconds = seconds
-        persist()
+        configurationChanged(devices: [])
     }
     public func requestLockAuthorization() -> Bool {
         let allowed = locker.requestAuthorization()
@@ -221,14 +312,66 @@ public final class MacRuntime {
     public func stop() async {
         let wasRunning = running
         running = false
+        packetTraffic.stop()
         pendingClipboard = nil; clipboardPreparation?.cancel(); clipboardWorker?.cancel()
         await clipboardWorker?.value
         locker.stop(); pasteboard.stop(); monitor?.cancel(); monitor = nil; lan = false
         for task in offers.values { task.cancel() }; offers.removeAll()
+        for task in configurationWorkers.values { task.cancel() }
+        configurationWorkers.removeAll(); configurationWrites.removeAll(); configurationGenerations.removeAll()
+        configurationReady.removeAll()
         if wasRunning { await bluetooth.stop() } else { await coordinator.stop() }
         await server.stop()
         for token in observation { NSWorkspace.shared.notificationCenter.removeObserver(token) }; observation.removeAll()
-        connected.removeAll(); routes.removeAll(); switching.removeAll()
+        connected.removeAll(); routes.removeAll(); switching.removeAll(); activities.removeAll()
+    }
+    private func configurationChanged(devices: Set<UUID>? = nil) {
+        if configuration.revision < Int64.max { configuration.revision += 1 }
+        persist(); synchronizeConfiguration(devices: devices)
+    }
+    private func synchronizeConfiguration(targets: Set<UUID>? = nil, devices: Set<UUID>? = nil) {
+        let mac = ManagedDevice(id: configuration.identity, name: configuration.name, kind: .mac, wifi: configuration.wifi, priority: 0)
+        var records: [ManagedDevice?] = [nil]
+        for (index, profile) in configuration.peers.enumerated() {
+            if profile.kind == nil && profile.name == nil { continue }
+            if let peer = profile.identity, devices == nil || devices!.contains(peer) {
+                records.append(ManagedDevice(id: peer, name: profile.name ?? peer.uuidString, kind: profile.kind ?? .phone,
+                    wifi: profile.wifi ?? true, priority: index + 1, renameRequest: profile.renameRequest))
+            }
+        }
+        let primary = configuration.peers.first(where: { $0.id == configuration.primary })?.identity
+        for target in (targets ?? connected).intersection(connected).intersection(configurationReady) {
+            for device in records {
+                configurationWrites[target, default: [:]][device?.id ?? mac.id] = ManagedConfiguration(revision: configuration.revision,
+                    mac: mac, device: device, primary: primary, lockEnabled: configuration.lockEnabled, lockDelaySeconds: configuration.lockDelaySeconds)
+            }
+            guard configurationWorkers[target] == nil else { continue }
+            let generation = UUID(); configurationGenerations[target] = generation
+            configurationWorkers[target] = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.configurationGenerations[target] == generation {
+                        self.configurationWorkers.removeValue(forKey: target)
+                        self.configurationGenerations.removeValue(forKey: target)
+                    }
+                }
+                while !Task.isCancelled, self.configurationGenerations[target] == generation,
+                      self.connected.contains(target), let next = self.configurationWrites[target]?.first {
+                    self.configurationWrites[target]?.removeValue(forKey: next.key)
+                    do { try await self.coordinator.sendConfiguration(next.value, to: target) }
+                    catch { break } // The next authenticated connection sends a fresh snapshot.
+                }
+            }
+        }
+    }
+    private func stopActivity(_ peer: UUID, _ id: UUID, sending: Bool? = nil) {
+        activities[peer]?.removeAll { $0.id == id && (sending == nil || $0.sending == sending) }
+        if activities[peer]?.isEmpty == true { activities.removeValue(forKey: peer) }
+    }
+    private func wireSignal(_ id: UUID, _ event: ConnectionSignal, logical: Bool) {
+        guard running, let profile = configuration.peers.first(where: { logical ? $0.identity == id : $0.id == id }) else { return }
+        if case .packet(_, false) = event, profile.identity.map({ connected.contains($0) }) != true { return }
+        packetTraffic.signal(profile.id, event)
     }
     private func persist() { preferences.set(try? Wire.encodeJSON(configuration), forKey: "Andcintosh.configuration") }
     private func configureLock() {
@@ -304,6 +447,7 @@ public final class MacRuntime {
             if let device = configuration.peers.first(where: { $0.identity == peer }) { failures.removeValue(forKey: device.id) }
             routes[peer] = .ble; switching.remove(peer)
             connected.insert(peer); locker.connected(peer); pasteboard.start()
+            synchronizeConfiguration(targets: [peer])
             if pasteboard.permitted {
                 do { let value = try pasteboard.current(); queueClipboard(file: value.0, text: value.1, mime: value.2, targets: [peer]) }
                 catch { failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable }
@@ -312,20 +456,36 @@ public final class MacRuntime {
         case .disconnected(let peer, let intentional):
             routes.removeValue(forKey: peer); switching.remove(peer)
             connected.remove(peer); locker.disconnected(peer, intentional: intentional)
+            activities.removeValue(forKey: peer)
+            if let profile = configuration.peers.first(where: { $0.identity == peer }) { packetTraffic.stop(profile.id) }
+            configurationReady.remove(peer)
+            configurationWorkers.removeValue(forKey: peer)?.cancel(); configurationWrites.removeValue(forKey: peer)
+            configurationGenerations.removeValue(forKey: peer)
             bluetooth.sessionDisconnected(peer, intentional: intentional)
             offers.removeValue(forKey: peer)?.cancel()
             if connected.isEmpty { pasteboard.stop(); await server.stop() }
-        case .received(_, let manifest, let url): if manifest.kind != .file { try pasteboard.apply(manifest, file: url) }
+        case .received(let peer, let manifest, let url):
+            stopActivity(peer, manifest.id, sending: false)
+            if manifest.kind != .file { try pasteboard.apply(manifest, file: url) }
         case .progress(_, let id, let bytes, let size): progress[id] = (bytes, size); transfers[id]?.bytes = bytes
-        case .failed(let peer, let id, let code): failures[peer] = code; transfers[id]?.failure = code
+        case .failed(let peer, let id, let code):
+            stopActivity(peer, id); failures[peer] = code; transfers[id]?.failure = code
         case .wifiChanged(let peer, let enabled):
+            if let index = configuration.peers.firstIndex(where: { $0.identity == peer }), configuration.peers[index].wifi != enabled {
+                configuration.peers[index].wifi = enabled; configurationChanged(devices: [peer])
+            }
             if enabled { scheduleOffer(peer) }
             else {
                 var eligible = false
                 for candidate in connected where await coordinator.permitsWifi(candidate) { eligible = true }
                 if !eligible { await server.stop() }
             }
-        case .completed(_, let id): progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
+        case .completed(let peer, let id): stopActivity(peer, id, sending: true); progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
+        case .deviceInformation(let peer, let value): try acceptDeviceInformation(peer, value)
+        case .transferStarted(let peer, let manifest, let sending):
+            stopActivity(peer, manifest.id, sending: sending)
+            activities[peer, default: []].append(LinkActivity(id: manifest.id, kind: manifest.kind, sending: sending))
+        case .transferStopped(let peer, let id): stopActivity(peer, id)
         case .transportChanged(let peer, let route):
             guard connected.contains(peer) else { return }
             if let route { routes[peer] = route; switching.remove(peer) }

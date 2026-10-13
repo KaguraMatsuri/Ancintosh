@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
@@ -29,14 +30,16 @@ import kotlinx.coroutines.sync.withLock
 
 data class FileTransfer(val id: UUID, val name: String, val size: Long, val bytes: Long = 0, val failure: Failure? = null)
 data class SyncStatus(val running: Boolean = true, val ready: Boolean = false, val peer: UUID? = null,
-                      val preparing: Boolean = false, val failure: Failure? = null, val transfers: List<FileTransfer> = emptyList())
+                      val preparing: Boolean = false, val failure: Failure? = null, val transfers: List<FileTransfer> = emptyList(), val configurationGeneration: Long = 0)
 
 class SyncService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val preparation = Mutex()
+    private val deviceReporting = Mutex()
     private var startup: Job? = null
     private lateinit var peripheral: BLEPeripheral
     private lateinit var tcp: TCPClient
+    private lateinit var settings: DeviceSettings
     lateinit var session: SessionController; private set
     lateinit var files: FileAccess; private set
     private val mutableStatus = MutableStateFlow(SyncStatus())
@@ -62,7 +65,7 @@ class SyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         foregroundNotification()
-        val settings = DeviceSettings(this)
+        settings = DeviceSettings(this)
         val store = TransferStore(File(filesDir, "state"), stagedPublish = { file, manifest, check, commit ->
             FileAccess.publish(this, file, manifest, commit, check)
         }) { file, manifest -> FileAccess.publish(this, file, manifest) }
@@ -73,6 +76,9 @@ class SyncService : Service() {
             if (event is SyncEvent.Delivered) files.apply(event.result)
             if (event is SyncEvent.Disconnected && ::peripheral.isInitialized) peripheral.sessionDisconnected()
             if (event is SyncEvent.Offer) scope.launch { tcp.connect(event) }
+            if (event is SyncEvent.Connected || event is SyncEvent.ConfigurationReady) reportDevice()
+            if (event is SyncEvent.Configuration) settings.applyConfiguration(event.value, event.json)
+            if (event is SyncEvent.ConfigurationRejected) settings.rejectRename(event.request)
             mutableStatus.update { current ->
                 when (event) {
                     is SyncEvent.Connected -> current.copy(peer = event.peer, failure = null)
@@ -80,6 +86,8 @@ class SyncService : Service() {
                     is SyncEvent.Progress -> current.copy(transfers = current.transfers.map { if (it.id == event.id) it.copy(bytes = event.offset) else it })
                     is SyncEvent.Failed -> current.copy(failure = event.code, transfers = current.transfers.map { if (it.id == event.id) it.copy(failure = event.code) else it })
                     is SyncEvent.Completed -> current.copy(transfers = current.transfers.filterNot { it.id == event.id })
+                    is SyncEvent.Configuration -> current.copy(configurationGeneration = current.configurationGeneration + 1)
+                    is SyncEvent.ConfigurationRejected -> current.copy(failure = event.code, configurationGeneration = current.configurationGeneration + 1)
                     else -> current
                 }
             }
@@ -102,6 +110,18 @@ class SyncService : Service() {
                 mutableStatus.update { it.copy(transfers = restored) }
                 startRadio()
             } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { report(error) }
+        }
+    }
+    suspend fun reportDevice() = deviceReporting.withLock {
+        val kind = if (resources.configuration.smallestScreenWidthDp >= 600) DeviceKind.pad else DeviceKind.phone
+        session.reportDevice(settings.information(kind))
+    }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        scope.launch {
+            try { reportDevice() }
+            catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) { report(error) }
         }
     }

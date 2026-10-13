@@ -45,9 +45,12 @@ public actor TCPServer {
 
     private let identity: UUID
     private let coordinator: SyncCoordinator
+    private let signal: (@Sendable (UUID, ConnectionSignal) async -> Void)?
     private let queue = DispatchQueue(label: "Andcintosh.listener", qos: .utility)
 
-    public init(identity: UUID, coordinator: SyncCoordinator) { self.identity = identity; self.coordinator = coordinator }
+    public init(identity: UUID, coordinator: SyncCoordinator, signal: (@Sendable (UUID, ConnectionSignal) async -> Void)? = nil) {
+        self.identity = identity; self.coordinator = coordinator; self.signal = signal
+    }
 
     public func start() async throws -> [TCPAddress] {
         if ready { return addresses() }
@@ -132,11 +135,17 @@ public actor TCPServer {
             let hello = try await Handshake.readHello(channel: channel)
             guard hello.role == .android else { throw ProtocolFailure.invalidHandshake }
             let key = try await coordinator.bindingKey(peer: hello.peerID, context: hello.contextID)
+            let signal = self.signal, token = UUID()
+            await signal?(hello.peerID, .handshakeStarted(token))
+            defer { Task { await signal?(hello.peerID, .handshakeEnded(token)) } }
+            let packet: @Sendable (Bool, Bool) -> Void = { sending, handshake in
+                Task { await signal?(hello.peerID, .packet(sending: sending, handshake: handshake)) }
+            }
             let auth = try await Handshake.authenticate(channel: channel, role: .mac, identity: identity,
                                                         key: key, context: hello.contextID, transport: .tcp,
-                                                        expectedPeer: hello.peerID, remoteHello: hello)
+                                                        expectedPeer: hello.peerID, remoteHello: hello, traffic: { packet($0, true) })
             timeout.cancel()
-            try await coordinator.installTCP(auth.peer, channel: EncryptedChannel(raw: channel, authentication: auth, transport: .tcp), context: hello.contextID)
+            try await coordinator.installTCP(auth.peer, channel: EncryptedChannel(raw: channel, authentication: auth, transport: .tcp, traffic: { packet($0, false) }), context: hello.contextID)
         } catch { timeout.cancel(); await channel.close() }
     }
 }
