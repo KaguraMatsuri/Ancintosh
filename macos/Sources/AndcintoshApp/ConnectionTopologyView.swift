@@ -26,7 +26,7 @@ struct ConnectionTopologyView: View {
     let move: (UUID, Bool) -> Void
     let place: ([UUID: NodePosition]) -> Void
     private let macHeight: CGFloat = 128
-    private let nodeHeight: CGFloat = 168
+    private let nodeHeight: CGFloat = 208
     private struct DragSession {
         let id: UUID
         let origin: CGPoint
@@ -71,19 +71,7 @@ struct ConnectionTopologyView: View {
                 .accessibilityHidden(true)
                 .allowsHitTesting(false)
                 ForEach(devices) { device in
-                    let center = point(device, in: size)
-                    if device.connected && !device.activities.isEmpty {
-                        ForEach([true, false], id: \.self) { sending in
-                            if device.activities.contains(where: { $0.sending == sending }) {
-                                let clipboard = sending && device.activities.contains { $0.sending && $0.kind != .file }
-                                Text(clipboard ? "发送粘贴板中" : "数据传输中")
-                                    .font(.caption).padding(4).background(.background, in: RoundedRectangle(cornerRadius: 4))
-                                    .position(labelPoint(center, mac: mac, sending: sending))
-                                    .zIndex(2).allowsHitTesting(false)
-                            }
-                        }
-                    }
-                    node(device, size: size).position(center)
+                    node(device, size: size).position(point(device, in: size))
                 }
                 VStack(spacing: 6) {
                     Image(systemName: "laptopcomputer").font(.system(size: 40)).accessibilityHidden(true)
@@ -124,6 +112,18 @@ struct ConnectionTopologyView: View {
                 Text(device.switching ? "切换中" : (device.route == .tcp ? "局域网传输" : "蓝牙传输"))
                     .font(.caption2).foregroundStyle(.secondary)
             }
+            VStack(spacing: 5) {
+                ForEach([true, false], id: \.self) { sending in
+                    let active = device.connected && device.activities.contains { $0.sending == sending }
+                    let clipboard = sending && device.activities.contains { $0.sending && $0.kind != .file }
+                    Text(clipboard ? "发送粘贴板中" : "数据传输中")
+                        .font(.caption).lineLimit(1)
+                        .opacity(active ? 1 : 0)
+                        .accessibilityHidden(!active)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(height: 40)
             Text("\(device.priority)").font(.caption2).foregroundStyle(.secondary)
         }
         .frame(width: nodeWidth(size), height: nodeHeight)
@@ -164,12 +164,6 @@ struct ConnectionTopologyView: View {
         }
         .accessibilityAction(named: "上移") { move(device.id, false) }
         .accessibilityAction(named: "下移") { move(device.id, true) }
-    }
-    private func labelPoint(_ end: CGPoint, mac: CGPoint, sending: Bool) -> CGPoint {
-        let dx = end.x - mac.x, dy = end.y - mac.y, length = max(1, hypot(dx, dy))
-        let side: CGFloat = sending ? 18 : -18
-        return CGPoint(x: (mac.x + end.x) / 2 - dy / length * side,
-                       y: (mac.y + end.y) / 2 + dx / length * side)
     }
     private func initialPosition(_ device: TopologyDevice, _ size: CGSize) -> CGPoint {
         // Initial placement follows stable IDs. Priority remains independent of position.
