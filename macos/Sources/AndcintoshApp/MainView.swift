@@ -5,6 +5,7 @@ import SwiftUI
 
 struct MainView: View {
     @Bindable var runtime: MacRuntime
+    @State private var dividerReady = false
     @State private var editing: PeerProfile?
     @State private var editingMac = false
     @State private var macNameDraft = ""
@@ -16,6 +17,47 @@ struct MainView: View {
     @State private var lockDelayError: String?
 
     var body: some View {
+        HSplitView {
+            settings.frame(minWidth: dividerReady ? 280 : 320, idealWidth: 320,
+                maxWidth: dividerReady ? 420 : 320, maxHeight: .infinity)
+            GeometryReader { geometry in
+                ScrollView {
+                    topology
+                        .frame(height: max(geometry.size.height - 32,
+                            max(500, CGFloat((runtime.configuration.peers.count + 3) / 4) * 160 + 240)))
+                        .padding(16)
+                }
+            }
+            .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .onAppear {
+            runtime.refreshPermissions(); resetLockDelayDraft()
+            // Seed the native divider once before allowing the full drag range.
+            DispatchQueue.main.async { dividerReady = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in runtime.refreshPermissions() }
+        .sheet(isPresented: $editingMac) {
+            VStack {
+                Form {
+                    TextField("设备名称", text: $macNameDraft)
+                    if let macNameError { Text(macNameError) }
+                }.formStyle(.grouped)
+                HStack {
+                    Button("取消", role: .cancel) { editingMac = false }.keyboardShortcut(.cancelAction)
+                    Button("保存") {
+                        do { try runtime.renameMac(macNameDraft); editingMac = false }
+                        catch { macNameError = Copy.failure(error) }
+                    }.keyboardShortcut(.defaultAction)
+                }.padding()
+            }.frame(idealWidth: 400, idealHeight: 180)
+        }
+        .sheet(item: $editing) { profile in PeerEditor(profile: profile, runtime: runtime) }
+        .alert("操作未完成", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("确定", role: .cancel) { error = nil }
+        } message: { Text(error ?? "") }
+    }
+
+    private var settings: some View {
         Form {
             Section("连接") {
                 LabeledContent("状态", value: runtime.connected.isEmpty ? (runtime.running ? "等待连接" : "已停止") : "已连接")
@@ -23,21 +65,6 @@ struct MainView: View {
                     Button("查找设备") { runtime.scan() }.disabled(busy).accessibilityLabel("查找设备")
                     if runtime.running { Button("停止") { perform { await runtime.stop() } }.disabled(busy) }
                 }
-                ConnectionTopologyView(macName: runtime.configuration.name,
-                    devices: runtime.configuration.peers.enumerated().map { index, profile in
-                        let peer = profile.identity
-                        return TopologyDevice(profile: profile, priority: index + 1,
-                            connected: peer.map { runtime.connected.contains($0) } == true,
-                            route: peer.flatMap { runtime.routes[$0] }, switching: peer.map { runtime.switching.contains($0) } == true,
-                            activities: peer.flatMap { runtime.activities[$0] } ?? [], position: runtime.configuration.nodePositions[profile.id.uuidString],
-                            signalSending: runtime.packetTraffic.sending.contains(profile.id), signalReceiving: runtime.packetTraffic.receiving.contains(profile.id),
-                            communicating: runtime.packetTraffic.visible.contains(profile.id))
-                    }, busy: busy, editMac: { macNameDraft = runtime.configuration.name; macNameError = nil; editingMac = true },
-                    connect: { id in
-                        guard let profile = runtime.configuration.peers.first(where: { $0.id == id }) else { return }
-                        do { try runtime.connect(profile) } catch { self.error = Copy.failure(error) }
-                    }, edit: { id in editing = runtime.configuration.peers.first(where: { $0.id == id }) },
-                    move: movePeer, place: runtime.placeNodes)
                 ForEach(runtime.discovered.values.sorted { $0.identifier.uuidString < $1.identifier.uuidString }, id: \.identifier) { device in
                     if !runtime.configuration.peers.contains(where: { $0.id == device.identifier }) {
                         LabeledContent(device.name ?? device.identifier.uuidString) {
@@ -126,28 +153,26 @@ struct MainView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { runtime.refreshPermissions(); resetLockDelayDraft() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in runtime.refreshPermissions() }
-        .sheet(isPresented: $editingMac) {
-            VStack {
-                Form {
-                    TextField("设备名称", text: $macNameDraft)
-                    if let macNameError { Text(macNameError) }
-                }.formStyle(.grouped)
-                HStack {
-                    Button("取消", role: .cancel) { editingMac = false }.keyboardShortcut(.cancelAction)
-                    Button("保存") {
-                        do { try runtime.renameMac(macNameDraft); editingMac = false }
-                        catch { macNameError = Copy.failure(error) }
-                    }.keyboardShortcut(.defaultAction)
-                }.padding()
-            }.frame(idealWidth: 400, idealHeight: 180)
-        }
-        .sheet(item: $editing) { profile in PeerEditor(profile: profile, runtime: runtime) }
-        .alert("操作未完成", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
-            Button("确定", role: .cancel) { error = nil }
-        } message: { Text(error ?? "") }
     }
+
+    private var topology: some View {
+        ConnectionTopologyView(macName: runtime.configuration.name,
+            devices: runtime.configuration.peers.enumerated().map { index, profile in
+                let peer = profile.identity
+                return TopologyDevice(profile: profile, priority: index + 1,
+                    connected: peer.map { runtime.connected.contains($0) } == true,
+                    route: peer.flatMap { runtime.routes[$0] }, switching: peer.map { runtime.switching.contains($0) } == true,
+                    activities: peer.flatMap { runtime.activities[$0] } ?? [], position: runtime.configuration.nodePositions[profile.id.uuidString],
+                    signalSending: runtime.packetTraffic.sending.contains(profile.id), signalReceiving: runtime.packetTraffic.receiving.contains(profile.id),
+                    communicating: runtime.packetTraffic.visible.contains(profile.id))
+            }, busy: busy, editMac: { macNameDraft = runtime.configuration.name; macNameError = nil; editingMac = true },
+            connect: { id in
+                guard let profile = runtime.configuration.peers.first(where: { $0.id == id }) else { return }
+                do { try runtime.connect(profile) } catch { self.error = Copy.failure(error) }
+            }, edit: { id in editing = runtime.configuration.peers.first(where: { $0.id == id }) },
+            move: movePeer, place: runtime.placeNodes)
+    }
+
     private func movePeer(_ id: UUID, down: Bool) {
         guard !busy, let index = runtime.configuration.peers.firstIndex(where: { $0.id == id }),
               down ? index + 1 < runtime.configuration.peers.count : index > 0 else { return }

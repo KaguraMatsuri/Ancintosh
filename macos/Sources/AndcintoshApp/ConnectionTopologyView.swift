@@ -108,7 +108,6 @@ struct ConnectionTopologyView: View {
                 }
             }
         }
-        .frame(height: max(500, CGFloat((devices.count + 3) / 4) * 160 + 240))
     }
 
     private func node(_ device: TopologyDevice, size: CGSize) -> some View {

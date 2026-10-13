@@ -33,7 +33,7 @@ struct AndcintoshApp: App {
             }
             .onAppear { delegate.runtime = runtime }
         }
-        .defaultSize(width: 640, height: 720)
+        .defaultSize(width: 1100, height: 760)
         MenuBarExtra("Andcintosh", systemImage: "arrow.triangle.2.circlepath") {
             RuntimeMenu(runtime: runtime)
         }
