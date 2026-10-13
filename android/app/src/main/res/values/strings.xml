@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Andcintosh</string>
+    <string name="app_name">Ancintosh</string>
     <string name="sync">同步</string>
     <string name="wifi">wifi传输</string>
     <string name="connection">连接</string>
@@ -27,7 +27,7 @@
     <string name="transfers">文件传输</string>
     <string name="progress">传输进度</string>
     <string name="paused">已暂停，重新连接后继续。</string>
-    <string name="downloads_help">接收文件保存到下载目录中的 Andcintosh 文件夹。</string>
+    <string name="downloads_help">接收文件保存到下载目录中的 Ancintosh 文件夹。</string>
     <string name="bluetooth_visibility">关闭 wifi传输后，数据仅通过蓝牙发送，Wi-Fi 网络观察者更难发现这部分传输；附近仍可检测到蓝牙信号。</string>
     <string name="notification_channel">设备连接</string>
     <string name="notification_body">保持蓝牙连接，等待同步和文件传输。</string>
@@ -36,7 +36,7 @@
     <string name="original_help">为保证图片文件完全一致，需要读取原图中已有的元数据。不会获取实时位置。</string>
     <string name="syncing">正在同步…</string>
     <string name="interrupted">同步已中断，请重试。</string>
-    <string name="start_first">请先在 Andcintosh 中保存密钥并启动。</string>
+    <string name="start_first">请先在 Ancintosh 中保存密钥并启动。</string>
     <string name="focus_wait">正在读取粘贴板…</string>
     <string name="share_title">同步到 Mac</string>
     <string name="operation_failed">操作未完成</string>
@@ -47,7 +47,7 @@
     <string name="error_source">无法读取内容，请重新选择文件或复制内容后重试。</string>
     <string name="error_space">可用空间不足，请清理存储后重试。</string>
     <string name="error_digest">文件校验失败，请重试。</string>
-    <string name="error_permission">权限未获允许，请在 Andcintosh 或系统设置中授权后重试。</string>
+    <string name="error_permission">权限未获允许，请在 Ancintosh 或系统设置中授权后重试。</string>
     <string name="error_peer">设备不可用，请检查蓝牙与连接后重试。</string>
     <string name="error_unsupported">设备或内容不支持此操作。</string>
     <string name="error_name">文件名无效，请重新选择文件。</string>

@@ -2,18 +2,18 @@
 import PackageDescription
 
 let package = Package(
-    name: "Andcintosh",
+    name: "Ancintosh",
     platforms: [.macOS("26.0")],
     products: [
-        .library(name: "AndcintoshCore", targets: ["AndcintoshCore"]),
-        .library(name: "AndcintoshPlatform", targets: ["AndcintoshPlatform"]),
-        .executable(name: "Andcintosh", targets: ["AndcintoshApp"]),
+        .library(name: "AncintoshCore", targets: ["AncintoshCore"]),
+        .library(name: "AncintoshPlatform", targets: ["AncintoshPlatform"]),
+        .executable(name: "Ancintosh", targets: ["AncintoshApp"]),
     ],
     targets: [
-        .target(name: "AndcintoshCore"),
-        .target(name: "AndcintoshPlatform", dependencies: ["AndcintoshCore"]),
-        .executableTarget(name: "AndcintoshApp", dependencies: ["AndcintoshPlatform", "AndcintoshCore"]),
-        .testTarget(name: "AndcintoshCoreTests", dependencies: ["AndcintoshCore"]),
-        .testTarget(name: "AndcintoshPlatformTests", dependencies: ["AndcintoshPlatform", "AndcintoshCore"]),
+        .target(name: "AncintoshCore"),
+        .target(name: "AncintoshPlatform", dependencies: ["AncintoshCore"]),
+        .executableTarget(name: "AncintoshApp", dependencies: ["AncintoshPlatform", "AncintoshCore"]),
+        .testTarget(name: "AncintoshCoreTests", dependencies: ["AncintoshCore"]),
+        .testTarget(name: "AncintoshPlatformTests", dependencies: ["AncintoshPlatform", "AncintoshCore"]),
     ]
 )

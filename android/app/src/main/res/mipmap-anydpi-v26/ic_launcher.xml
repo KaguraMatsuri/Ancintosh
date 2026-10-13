@@ -3,7 +3,7 @@
     <background android:drawable="@android:color/white" />
     <foreground>
         <inset android:inset="17dp">
-            <bitmap android:src="@drawable/andcintosh_logo" android:gravity="fill" android:filter="true" />
+            <bitmap android:src="@drawable/ancintosh_logo" android:gravity="fill" android:filter="true" />
         </inset>
     </foreground>
 </adaptive-icon>

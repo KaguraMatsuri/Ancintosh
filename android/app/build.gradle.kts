@@ -1,6 +1,6 @@
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose") }
 android {
-    namespace = "io.github.kaguramatsuri.andcintosh"
+    namespace = "io.github.kaguramatsuri.ancintosh"
     compileSdk { version = release(37) { minorApiLevel = 2 } }
     defaultConfig {
         applicationId = "io.github.kaguramatsuri.andcintosh"

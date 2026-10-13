@@ -1,17 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>CFBundleName</key><string>Andcintosh</string>
-    <key>CFBundleDisplayName</key><string>Andcintosh</string>
-    <key>CFBundleExecutable</key><string>Andcintosh</string>
+    <key>CFBundleName</key><string>Ancintosh</string>
+    <key>CFBundleDisplayName</key><string>Ancintosh</string>
+    <key>CFBundleExecutable</key><string>Ancintosh</string>
     <key>CFBundleIdentifier</key><string>io.github.kaguramatsuri.Andcintosh</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleIconFile</key><string>Andcintosh.icns</string>
+    <key>CFBundleIconFile</key><string>Ancintosh.icns</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSBluetoothAlwaysUsageDescription</key><string>通过蓝牙发现并验证 Android，同步粘贴板、传输文件，并检测断连锁定。</string>
     <key>NSLocalNetworkUsageDescription</key><string>在蓝牙验证设备后，通过本地 Wi-Fi 或有线网络传输粘贴板和文件。</string>
-    <key>NSDownloadsFolderUsageDescription</key><string>将收到的文件保存到下载目录中的 Andcintosh 文件夹。</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>将收到的文件保存到下载目录中的 Ancintosh 文件夹。</string>
 </dict></plist>
