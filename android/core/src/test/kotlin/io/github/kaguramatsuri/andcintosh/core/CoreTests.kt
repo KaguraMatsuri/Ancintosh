@@ -26,11 +26,11 @@ class CoreTests {
         val scope = CoroutineScope(SupervisorJob() + coroutineContext.minusKey(Job))
         val input = Channel<Byte>(Channel.UNLIMITED)
         val blocked = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
-        val local = Hello(Role.ANDROID, phone, nonce = ByteArray(32) { 1 })
-        val remote = Hello(Role.MAC, mac, nonce = ByteArray(32) { 2 })
+        val local = Hello(Role.ANDROID, phone, nonce = ByteArray(32) { 1 }, publicKey = ByteArray(32) { 9 })
+        val remote = Hello(Role.MAC, mac, nonce = ByteArray(32) { 2 }, publicKey = ByteArray(32) { 9 })
         val key = ByteArray(32) { 3 }
-        val peerCrypto = CryptoSession(key, remote, local, Transport.ble)
-        val auth = Authentication(mac, CryptoSession(key, local, remote, Transport.ble))
+        val peerCrypto = CryptoSession(key, remote, local, Transport.ble, ByteArray(32) { 9 })
+        val auth = Authentication(mac, CryptoSession(key, local, remote, Transport.ble, ByteArray(32) { 9 }))
         val epochBytes = ByteBuffer.wrap(auth.crypto.root)
         val epoch = UUID(epochBytes.long, epochBytes.long)
         val writes = mutableListOf<RecordKind>(); val disconnects = mutableListOf<SyncEvent.Disconnected>()
@@ -83,13 +83,13 @@ class CoreTests {
             assertTrue(TransferStore(root) { _, _ -> error("Unexpected publication") }.restore().isEmpty())
         } finally { scope.cancel(); root.deleteRecursively() }
     }
-    @Test fun independentJavaFixture() {
-        val j = JSONObject(File("../../protocol/fixtures/v1.json").readText())
+    @Test fun independentJavaV2Fixture() {
+        val j = JSONObject(File("../../protocol/fixtures/v2.json").readText())
         val a = Hello.decode(j.getString("macHello").unhex()); val b = Hello.decode(j.getString("androidHello").unhex())
         val key = j.getString("key").unhex()
-        val tx = CryptoSession(key, a, b, Transport.ble); val rx = CryptoSession(key, b, a, Transport.ble)
+        val tx = CryptoSession(key, a, b, Transport.ble, j.getString("sharedSecret").unhex()); val rx = CryptoSession(key, b, a, Transport.ble, j.getString("sharedSecret").unhex())
         assertEquals(j.getString("root"), tx.root.hex())
-        assertEquals(j.getString("macProof"), Crypto.proof(key, a.encode() + b.encode(), Role.MAC).hex())
+        assertEquals(j.getString("macProof"), Crypto.proof(key, Crypto.transcript(a, b, Transport.ble), Role.MAC).hex())
         val record = Record.decode(j.getString("record").unhex())
         val frame = tx.seal(record); assertEquals(j.getString("sealed"), frame.hex())
         assertContentEquals(record.bytes, rx.open(frame).bytes)
@@ -100,13 +100,13 @@ class CoreTests {
         assertEquals("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", result.hex())
     }
     @Test fun rejectTamperWrongKeyAndTransport() {
-        val a = Hello(Role.MAC, mac, nonce = ByteArray(32) { 1 }); val b = Hello(Role.ANDROID, phone, nonce = ByteArray(32) { 2 })
-        val key = ByteArray(32) { 3 }; val frame = CryptoSession(key, a, b, Transport.ble).seal(Record(RecordKind.DATA, bytes = byteArrayOf(1,2,3)))
+        val a = Hello(Role.MAC, mac, nonce = ByteArray(32) { 1 }, publicKey = ByteArray(32) { 9 }); val b = Hello(Role.ANDROID, phone, nonce = ByteArray(32) { 2 }, publicKey = ByteArray(32) { 9 })
+        val key = ByteArray(32) { 3 }; val frame = CryptoSession(key, a, b, Transport.ble, ByteArray(32) { 9 }).seal(Record(RecordKind.DATA, bytes = byteArrayOf(1,2,3)))
         val bad = frame.clone(); bad[bad.lastIndex] = (bad.last().toInt() xor 1).toByte()
-        assertEquals(Failure.authenticationFailed, assertFailsWith<ProtocolException> { CryptoSession(key,b,a,Transport.ble).open(bad) }.code)
-        assertFailsWith<ProtocolException> { CryptoSession(ByteArray(32) { 4 },b,a,Transport.ble).open(frame) }
-        assertFailsWith<ProtocolException> { CryptoSession(key,b,a,Transport.tcp).open(frame) }
-        assertFailsWith<ProtocolException> { CryptoSession(key,b,a,Transport.ble).open(frame.copyOf(frame.size-1)) }
+        assertEquals(Failure.authenticationFailed, assertFailsWith<ProtocolException> { CryptoSession(key,b,a, Transport.ble, ByteArray(32) { 9 }).open(bad) }.code)
+        assertFailsWith<ProtocolException> { CryptoSession(ByteArray(32) { 4 },b,a, Transport.ble, ByteArray(32) { 9 }).open(frame) }
+        assertFailsWith<ProtocolException> { CryptoSession(key,b,a, Transport.tcp, ByteArray(32) { 9 }).open(frame) }
+        assertFailsWith<ProtocolException> { CryptoSession(key,b,a, Transport.ble, ByteArray(32) { 9 }).open(frame.copyOf(frame.size-1)) }
     }
     @Test fun wifiPreferencesAndStability() {
         val route = TransportCoordinator(); route.path(true,0)

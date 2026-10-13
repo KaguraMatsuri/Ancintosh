@@ -6,16 +6,16 @@ import Testing
 private let macID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
 private let phoneID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
 
-@Test func independentJavaFixture() throws {
+@Test func independentJavaV2Fixture() throws {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    let fixture = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: root.appendingPathComponent("protocol/fixtures/v1.json")))
+    let fixture = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: root.appendingPathComponent("protocol/fixtures/v2.json")))
     let a = try Hello.decode(Data(hex: fixture["macHello"]!)!)
     let b = try Hello.decode(Data(hex: fixture["androidHello"]!)!)
     let key = Data(hex: fixture["key"]!)!
-    var tx = try CryptoSession(key: key, local: a, remote: b, transport: .ble)
-    var rx = try CryptoSession(key: key, local: b, remote: a, transport: .ble)
+    var tx = try CryptoSession(key: key, local: a, remote: b, transport: .ble, sharedSecret: Data(hex: fixture["sharedSecret"]!)!)
+    var rx = try CryptoSession(key: key, local: b, remote: a, transport: .ble, sharedSecret: Data(hex: fixture["sharedSecret"]!)!)
     #expect(tx.root.hex == fixture["root"])
-    var transcript = a.encoded(); transcript.append(b.encoded())
+    let transcript = Crypto.transcript(local: a, remote: b, transport: .ble)
     #expect(Crypto.proof(key: key, transcript: transcript, role: .mac).hex == fixture["macProof"])
     let record = try Record.decode(Data(hex: fixture["record"]!)!)
     let frame = try tx.seal(record)
@@ -25,8 +25,8 @@ private let phoneID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
 }
 
 @Test func helloAndRecordRoundTrip() throws {
-    let hello = try Hello(role: .mac, peerID: macID, nonce: Data(repeating: 1, count: 32))
-    #expect(hello.encoded().count == 73)
+    let hello = try Hello(role: .mac, peerID: macID, nonce: Data(repeating: 1, count: 32), publicKey: Data(repeating: 9, count: 32))
+    #expect(hello.encoded().count == 105)
     #expect(hello.encoded().prefix(7) == Data("Ciallo~".utf8))
     #expect(try Hello.decode(hello.encoded()) == hello)
     let record = Record(.data, transferID: phoneID, offset: 1 << 40, bytes: Data([0, 128, 255]))
@@ -36,11 +36,11 @@ private let phoneID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
 }
 
 @Test func cryptographicAuthenticationAndReplay() throws {
-    let a = try Hello(role: .mac, peerID: macID, nonce: Data(repeating: 1, count: 32))
-    let b = try Hello(role: .android, peerID: phoneID, nonce: Data(repeating: 2, count: 32))
+    let a = try Hello(role: .mac, peerID: macID, nonce: Data(repeating: 1, count: 32), publicKey: Data(repeating: 9, count: 32))
+    let b = try Hello(role: .android, peerID: phoneID, nonce: Data(repeating: 2, count: 32), publicKey: Data(repeating: 9, count: 32))
     let key = Data(repeating: 3, count: 32)
-    var tx = try CryptoSession(key: key, local: a, remote: b, transport: .ble)
-    var rx = try CryptoSession(key: key, local: b, remote: a, transport: .ble)
+    var tx = try CryptoSession(key: key, local: a, remote: b, transport: .ble, sharedSecret: Data(repeating: 9, count: 32))
+    var rx = try CryptoSession(key: key, local: b, remote: a, transport: .ble, sharedSecret: Data(repeating: 9, count: 32))
     let record = Record(.data, offset: 0, bytes: Data("payload".utf8))
     let sealed = try tx.seal(record)
     #expect(try rx.open(sealed) == record)
@@ -48,9 +48,9 @@ private let phoneID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
     var tampered = try tx.seal(record)
     tampered[tampered.count - 1] ^= 1
     #expect(throws: ProtocolFailure.authenticationFailed) { try rx.open(tampered) }
-    var wrong = try CryptoSession(key: Data(repeating: 4, count: 32), local: b, remote: a, transport: .ble)
+    var wrong = try CryptoSession(key: Data(repeating: 4, count: 32), local: b, remote: a, transport: .ble, sharedSecret: Data(repeating: 9, count: 32))
     #expect(throws: ProtocolFailure.authenticationFailed) { try wrong.open(sealed) }
-    var tcp = try CryptoSession(key: key, local: b, remote: a, transport: .tcp)
+    var tcp = try CryptoSession(key: key, local: b, remote: a, transport: .tcp, sharedSecret: Data(repeating: 9, count: 32))
     #expect(throws: ProtocolFailure.authenticationFailed) { try tcp.open(sealed) }
 }
 

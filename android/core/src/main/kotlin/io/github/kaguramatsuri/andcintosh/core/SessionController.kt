@@ -212,7 +212,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                     val array = j.getJSONArray("addresses"); if (secret.size != 32 || array.length() !in 1..8) fail(Failure.invalidFrame)
                     val addresses = (0 until array.length()).map { array.getJSONObject(it).let { a -> a.getString("host") to a.getInt("port") } }
                     offer = context
-                    events(SyncEvent.Offer(current, context, addresses, Crypto.derive(channel.root, secret, "Andcintosh/v1/tcp-binding")))
+                    events(SyncEvent.Offer(current, context, addresses, Crypto.derive(channel.root, secret, "Andcintosh/v2/tcp-binding")))
                 }
                 RecordKind.GOODBYE -> { if (isTCP) fail(Failure.invalidFrame); disconnect(true) }
                 RecordKind.TRANSPORT_SWITCH -> {

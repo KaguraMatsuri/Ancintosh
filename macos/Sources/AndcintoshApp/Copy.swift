@@ -8,6 +8,7 @@ enum Copy {
     static func failure(_ error: any Error) -> String {
         guard let code = error as? ProtocolFailure else { return "操作未完成，请检查文件和权限后重试。" }
         switch code {
+        case .unsupportedVersion: return "协议版本不兼容，请更新两端客户端。"
         case .invalidKey: return "密钥须为 64 位十六进制字符。"
         case .authenticationFailed: return "认证失败，请检查两端密钥是否一致。"
         case .originalUnavailable: return "无法取得图片原文件，请从文件或原图分享入口发送。"

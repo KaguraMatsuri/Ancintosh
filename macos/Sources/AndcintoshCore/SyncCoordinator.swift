@@ -91,7 +91,7 @@ public actor SyncCoordinator {
               offer.id == context, let secret = Data(hex: offer.secret), secret.count == 32 else {
             throw ProtocolFailure.authenticationFailed
         }
-        return Crypto.derive(entry.ble.root, salt: secret, info: "Andcintosh/v1/tcp-binding")
+        return Crypto.derive(entry.ble.root, salt: secret, info: "Andcintosh/v2/tcp-binding")
     }
 
     public func installTCP(_ peer: UUID, channel: EncryptedChannel, context: UUID) async throws {
@@ -267,7 +267,7 @@ public actor SyncCoordinator {
                       let secret = Data(hex: offer.secret), secret.count == 32 else { throw ProtocolFailure.invalidFrame }
                 entry.offer = offer
                 peers[peer] = entry
-                let binding = Crypto.derive(entry.ble.root, salt: secret, info: "Andcintosh/v1/tcp-binding")
+                let binding = Crypto.derive(entry.ble.root, salt: secret, info: "Andcintosh/v2/tcp-binding")
                 try await events(.tcpOffer(peer, offer, binding))
             case .goodbye:
                 guard !tcp else { throw ProtocolFailure.invalidFrame }

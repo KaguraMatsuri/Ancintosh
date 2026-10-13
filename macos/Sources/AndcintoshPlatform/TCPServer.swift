@@ -102,7 +102,7 @@ public actor TCPServer {
         let channel = TCPByteChannel(connection)
         let timeout = Task { try? await Task.sleep(for: .seconds(5)); if !Task.isCancelled { await channel.close() } }
         do {
-            let hello = try Hello.decode(await channel.readExactly(Wire.helloSize))
+            let hello = try await Handshake.readHello(channel: channel)
             guard hello.role == .android else { throw ProtocolFailure.invalidHandshake }
             let key = try await coordinator.bindingKey(peer: hello.peerID, context: hello.contextID)
             let auth = try await Handshake.authenticate(channel: channel, role: .mac, identity: identity,

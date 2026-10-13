@@ -25,15 +25,21 @@ public enum Crypto {
         return result.withUnsafeBytes { Data($0) }
     }
 
+    public static func transcript(local: Hello, remote: Hello, transport: TransportKind) -> Data {
+        let mac = local.role == .mac ? local : remote
+        let android = local.role == .android ? local : remote
+        return Data("Andcintosh/v2/\(transport.rawValue)/".utf8) + mac.encoded() + android.encoded()
+    }
+
     public static func proof(key: Data, transcript: Data, role: PeerRole) -> Data {
-        var input = Data("Andcintosh/v1/proof/".utf8)
+        var input = Data("Andcintosh/v2/proof/".utf8)
         input.append(role.rawValue)
         input.append(transcript)
         return Data(HMAC<SHA256>.authenticationCode(for: input, using: SymmetricKey(data: key)))
     }
 
     public static func verify(_ proof: Data, key: Data, transcript: Data, role: PeerRole) -> Bool {
-        var input = Data("Andcintosh/v1/proof/".utf8)
+        var input = Data("Andcintosh/v2/proof/".utf8)
         input.append(role.rawValue)
         input.append(transcript)
         return HMAC<SHA256>.isValidAuthenticationCode(proof, authenticating: input, using: SymmetricKey(data: key))
@@ -42,33 +48,41 @@ public enum Crypto {
 
 public struct CryptoSession: Sendable {
     public let root: Data
-    private let txKey: SymmetricKey
-    private let rxKey: SymmetricKey
+    private var txKey: SymmetricKey
+    private var rxKey: SymmetricKey
+    private let txDirection: String
+    private let rxDirection: String
+    private var txEpoch: UInt64 = 0
+    private var rxEpoch: UInt64 = 0
     private let txPrefix: Data
     private let rxPrefix: Data
-    private var txSequence: UInt64 = 0
-    private var rxSequence: UInt64 = 0
+    var txSequence: UInt64 = 0
+    var rxSequence: UInt64 = 0
 
-    public init(key: Data, local: Hello, remote: Hello, transport: TransportKind) throws {
-        guard key.count == 32, local.role != remote.role, local.contextID == remote.contextID,
+    public init(key: Data, local: Hello, remote: Hello, transport: TransportKind, sharedSecret: Data) throws {
+        guard key.count == 32, sharedSecret.count == 32, sharedSecret.contains(where: { $0 != 0 }), local.role != remote.role, local.contextID == remote.contextID,
               local.nonce != remote.nonce else { throw ProtocolFailure.invalidHandshake }
         let mac = local.role == .mac ? local : remote
         let android = local.role == .android ? local : remote
-        var salt = mac.nonce
-        salt.append(android.nonce)
-        var transcript = mac.encoded()
-        transcript.append(android.encoded())
-        root = Crypto.derive(key, salt: salt, info: "Andcintosh/v1/\(transport.rawValue)/\(Crypto.digest(transcript))")
+        let salt = Data(HMAC<SHA256>.authenticationCode(for: mac.nonce + android.nonce, using: SymmetricKey(data: key)))
+        let transcript = Crypto.transcript(local: local, remote: remote, transport: transport)
+        root = Crypto.derive(sharedSecret, salt: salt, info: "Andcintosh/v2/session/\(Crypto.digest(transcript))")
         let tx = local.role == .mac ? "mac" : "android"
         let rx = local.role == .mac ? "android" : "mac"
-        txKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(tx)"))
-        rxKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(rx)"))
+        txDirection = tx; rxDirection = rx
+        txKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(tx)/0"))
+        rxKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(rx)/0"))
         txPrefix = Crypto.derive(root, salt: Data(), info: "nonce/\(tx)", count: 4)
         rxPrefix = Crypto.derive(root, salt: Data(), info: "nonce/\(rx)", count: 4)
     }
 
     public mutating func seal(_ record: Record) throws -> Data {
-        guard txSequence < UInt64.max else { throw ProtocolFailure.invalidFrame }
+        guard txSequence < UInt64(Int64.max) else { throw ProtocolFailure.invalidFrame }
+        let epoch = txSequence >> 20
+        if epoch != txEpoch {
+            txKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(txDirection)/\(epoch)"))
+            txEpoch = epoch
+        }
         let plaintext = try record.encoded()
         var header = Data()
         header.appendBE(UInt32(plaintext.count + 16))
@@ -91,7 +105,12 @@ public struct CryptoSession: Sendable {
         guard length <= Wire.maxPlaintext + 16, Int(length) == reader.remaining else {
             throw ProtocolFailure.invalidFrame
         }
-        guard sequence == rxSequence, rxSequence < UInt64.max else { throw ProtocolFailure.replay }
+        guard sequence == rxSequence, rxSequence < UInt64(Int64.max) else { throw ProtocolFailure.replay }
+        let epoch = sequence >> 20
+        if epoch != rxEpoch {
+            rxKey = SymmetricKey(data: Crypto.derive(root, salt: Data(), info: "key/\(rxDirection)/\(epoch)"))
+            rxEpoch = epoch
+        }
         var nonce = rxPrefix
         nonce.appendBE(sequence)
         let ciphertext = try reader.bytes(Int(length) - 16)

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public protocol ByteChannel: Sendable {
     func readExactly(_ count: Int) async throws -> Data
@@ -12,24 +13,35 @@ public struct Authentication: Sendable {
 }
 
 public enum Handshake {
+    public static func readHello(channel: any ByteChannel) async throws -> Hello {
+        let prefix = try await channel.readExactly(8)
+        guard prefix.prefix(7) == Wire.magic else { throw ProtocolFailure.invalidHandshake }
+        guard prefix.last == Wire.version else { throw ProtocolFailure.unsupportedVersion }
+        return try Hello.decode(prefix + (try await channel.readExactly(Wire.helloSize - 8)))
+    }
+
     public static func authenticate(channel: any ByteChannel, role: PeerRole, identity: UUID,
                                     key: Data, context: UUID = Wire.zeroID, transport: TransportKind,
                                     expectedPeer: UUID? = nil, remoteHello: Hello? = nil) async throws -> Authentication {
-        let local = try Hello(role: role, peerID: identity, contextID: context, nonce: Crypto.random(32))
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let local = try Hello(role: role, peerID: identity, contextID: context, nonce: Crypto.random(32), publicKey: ephemeral.publicKey.rawRepresentation)
         try await channel.write(local.encoded())
         let remote: Hello
         if let remoteHello { remote = remoteHello }
-        else { remote = try Hello.decode(await channel.readExactly(Wire.helloSize)) }
+        else { remote = try await readHello(channel: channel) }
         guard remote.role != role, remote.contextID == context,
               expectedPeer == nil || expectedPeer == remote.peerID else { throw ProtocolFailure.authenticationFailed }
-        let mac = role == .mac ? local : remote
-        let android = role == .android ? local : remote
-        var transcript = mac.encoded()
-        transcript.append(android.encoded())
+        let transcript = Crypto.transcript(local: local, remote: remote, transport: transport)
         try await channel.write(Crypto.proof(key: key, transcript: transcript, role: role))
         let proof = try await channel.readExactly(32)
         guard Crypto.verify(proof, key: key, transcript: transcript, role: remote.role) else { throw ProtocolFailure.authenticationFailed }
-        return try Authentication(peer: remote.peerID, session: CryptoSession(key: key, local: local, remote: remote, transport: transport))
+        let shared = try ephemeral.sharedSecretFromKeyAgreement(with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: remote.publicKey))
+        let session = try CryptoSession(key: key, local: local, remote: remote, transport: transport, sharedSecret: shared.withUnsafeBytes { Data($0) })
+        let finishedKey = Crypto.derive(session.root, salt: Data(), info: "finished")
+        try await channel.write(Crypto.proof(key: finishedKey, transcript: transcript, role: role))
+        let finished = try await channel.readExactly(32)
+        guard Crypto.verify(finished, key: finishedKey, transcript: transcript, role: remote.role) else { throw ProtocolFailure.authenticationFailed }
+        return Authentication(peer: remote.peerID, session: session)
     }
 }
 

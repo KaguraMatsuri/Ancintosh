@@ -1,7 +1,7 @@
 import Foundation
 
 public enum ProtocolFailure: String, Error, Codable, Sendable {
-    case invalidKey, invalidHandshake, authenticationFailed, invalidFrame, replay
+    case invalidKey, unsupportedVersion, invalidHandshake, authenticationFailed, invalidFrame, replay
     case oversizedRecord, invalidManifest, invalidOffset, digestMismatch
     case sourceUnavailable, originalUnavailable, insufficientSpace, cancelled
     case peerUnavailable, timeout, permissionDenied, invalidName, unsupported
@@ -17,8 +17,8 @@ public enum RecordKind: UInt8, Sendable {
 
 public enum Wire {
     public static let magic = Data("Ciallo~".utf8)
-    public static let version: UInt8 = 1
-    public static let helloSize = 73
+    public static let version: UInt8 = 2
+    public static let helloSize = 105
     public static let maxPlaintext = 65_536
     public static let recordHeaderSize = 45
     public static let maxMetadata = 8_192
@@ -42,13 +42,15 @@ public struct Hello: Sendable, Equatable {
     public let peerID: UUID
     public let contextID: UUID
     public let nonce: Data
+    public let publicKey: Data
 
-    public init(role: PeerRole, peerID: UUID, contextID: UUID = Wire.zeroID, nonce: Data) throws {
-        guard nonce.count == 32 else { throw ProtocolFailure.invalidHandshake }
+    public init(role: PeerRole, peerID: UUID, contextID: UUID = Wire.zeroID, nonce: Data, publicKey: Data) throws {
+        guard nonce.count == 32, publicKey.count == 32 else { throw ProtocolFailure.invalidHandshake }
         self.role = role
         self.peerID = peerID
         self.contextID = contextID
         self.nonce = nonce
+        self.publicKey = publicKey
     }
 
     public func encoded() -> Data {
@@ -58,6 +60,7 @@ public struct Hello: Sendable, Equatable {
         data.appendUUID(peerID)
         data.appendUUID(contextID)
         data.append(nonce)
+        data.append(publicKey)
         return data
     }
 
@@ -68,7 +71,7 @@ public struct Hello: Sendable, Equatable {
               let role = PeerRole(rawValue: try reader.byte()) else {
             throw ProtocolFailure.invalidHandshake
         }
-        return try Hello(role: role, peerID: reader.uuid(), contextID: reader.uuid(), nonce: reader.bytes(32))
+        return try Hello(role: role, peerID: reader.uuid(), contextID: reader.uuid(), nonce: reader.bytes(32), publicKey: reader.bytes(32))
     }
 }
 

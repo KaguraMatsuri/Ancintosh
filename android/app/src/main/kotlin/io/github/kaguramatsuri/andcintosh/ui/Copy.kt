@@ -6,6 +6,7 @@ import io.github.kaguramatsuri.andcintosh.core.ProtocolException
 
 fun failureText(error: Throwable): Int = failureText((error as? ProtocolException)?.code)
 fun failureText(code: Failure?): Int = when (code) {
+    Failure.unsupportedVersion -> R.string.error_version
     Failure.invalidKey -> R.string.error_key
     Failure.authenticationFailed -> R.string.error_auth
     Failure.originalUnavailable -> R.string.error_original

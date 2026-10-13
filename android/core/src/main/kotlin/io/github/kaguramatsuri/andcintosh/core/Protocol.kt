@@ -5,7 +5,7 @@ import java.nio.ByteOrder
 import java.util.UUID
 import org.json.JSONObject
 
-enum class Failure { invalidKey, invalidHandshake, authenticationFailed, invalidFrame, replay, oversizedRecord,
+enum class Failure { invalidKey, unsupportedVersion, invalidHandshake, authenticationFailed, invalidFrame, replay, oversizedRecord,
     invalidManifest, invalidOffset, digestMismatch, sourceUnavailable, originalUnavailable, insufficientSpace,
     cancelled, peerUnavailable, timeout, permissionDenied, invalidName, unsupported }
 class ProtocolException(val code: Failure) : Exception(code.name)
@@ -17,8 +17,8 @@ enum class RecordKind(val wire: Int) {
 }
 object Wire {
     val MAGIC = "Ciallo~".toByteArray(Charsets.US_ASCII)
-    const val VERSION = 1
-    const val HELLO_SIZE = 73
+    const val VERSION = 2
+    const val HELLO_SIZE = 105
     const val MAX_PLAINTEXT = 65536
     const val HEADER_SIZE = 45
     const val MAX_METADATA = 8192
@@ -35,10 +35,10 @@ fun String.unhex(): ByteArray {
 fun ByteBuffer.putUUID(id: UUID): ByteBuffer = putLong(id.mostSignificantBits).putLong(id.leastSignificantBits)
 fun ByteBuffer.uuid(): UUID = UUID(long, long)
 
-data class Hello(val role: Role, val peer: UUID, val context: UUID = Wire.ZERO_ID, val nonce: ByteArray) {
-    init { if (nonce.size != 32) fail(Failure.invalidHandshake) }
+data class Hello(val role: Role, val peer: UUID, val context: UUID = Wire.ZERO_ID, val nonce: ByteArray, val publicKey: ByteArray) {
+    init { if (nonce.size != 32 || publicKey.size != 32) fail(Failure.invalidHandshake) }
     fun encode(): ByteArray = ByteBuffer.allocate(Wire.HELLO_SIZE).order(ByteOrder.BIG_ENDIAN)
-        .put(Wire.MAGIC).put(Wire.VERSION.toByte()).put(role.wire.toByte()).putUUID(peer).putUUID(context).put(nonce).array()
+        .put(Wire.MAGIC).put(Wire.VERSION.toByte()).put(role.wire.toByte()).putUUID(peer).putUUID(context).put(nonce).put(publicKey).array()
     companion object {
         fun decode(data: ByteArray): Hello {
             if (data.size != Wire.HELLO_SIZE || !data.copyOfRange(0, 7).contentEquals(Wire.MAGIC)) fail(Failure.invalidHandshake)
@@ -47,7 +47,8 @@ data class Hello(val role: Role, val peer: UUID, val context: UUID = Wire.ZERO_I
             val role = Role.entries.firstOrNull { it.wire == b.get(b.position()).toInt() } ?: fail(Failure.invalidHandshake)
             b.get()
             val id = b.uuid(); val context = b.uuid(); val nonce = ByteArray(32); b.get(nonce)
-            return Hello(role, id, context, nonce)
+            val publicKey = ByteArray(32); b.get(publicKey)
+            return Hello(role, id, context, nonce, publicKey)
         }
     }
 }
