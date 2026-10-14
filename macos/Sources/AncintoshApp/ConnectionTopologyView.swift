@@ -8,19 +8,15 @@ struct TopologyDevice: Identifiable {
     let connected: Bool
     let route: TransportKind?
     let switching: Bool
-    let activities: [LinkActivity]
     let position: NodePosition?
-    var signalSending = false
-    var signalReceiving = false
-    var communicating = false
-    var handshaking = false
     var id: UUID { profile.id }
 }
 
 struct ConnectionTopologyView: View {
     let macName: String
     let devices: [TopologyDevice]
-    let busy: Bool
+    var runtime: MacRuntime
+    let operations: ViewOperations
     var connectionManagementEnabled = true
     let editMac: () -> Void
     let connect: (UUID) -> Void
@@ -44,34 +40,10 @@ struct ConnectionTopologyView: View {
             let size = geometry.size
             let mac = CGPoint(x: size.width / 2, y: size.height / 2)
             ZStack {
-                Canvas { context, _ in
-                    for device in devices where device.connected || device.communicating {
-                        let end = point(device, in: size)
-                        for sending in [true, false] {
-                            let origin = sending ? mac : end, target = sending ? end : mac
-                            let dx = target.x - origin.x, dy = target.y - origin.y
-                            let distance = max(1, hypot(dx, dy)), ux = dx / distance, uy = dy / distance
-                            let sourceHalfWidth = (sending ? macWidth(size) : nodeWidth(size)) / 2
-                            let targetHalfWidth = (sending ? nodeWidth(size) : macWidth(size)) / 2
-                            let sourceHalfHeight = (sending ? macHeight : nodeHeight) / 2
-                            let targetHalfHeight = (sending ? nodeHeight : macHeight) / 2
-                            let sourceMargin = min(sourceHalfWidth / max(0.001, abs(ux)), sourceHalfHeight / max(0.001, abs(uy))) + 2
-                            let targetMargin = min(targetHalfWidth / max(0.001, abs(ux)), targetHalfHeight / max(0.001, abs(uy))) + 2
-                            let start = CGPoint(x: origin.x + ux * sourceMargin - uy * 4, y: origin.y + uy * sourceMargin + ux * 4)
-                            let tip = CGPoint(x: target.x - ux * targetMargin - uy * 4, y: target.y - uy * targetMargin + ux * 4)
-                            guard distance > sourceMargin + targetMargin else { continue }
-                            var line = Path(); line.move(to: start); line.addLine(to: tip)
-                            // Both branches share the line's endpoint, color and Path.
-                            line.addLine(to: CGPoint(x: tip.x - ux * 8 - uy * 4, y: tip.y - uy * 8 + ux * 4))
-                            line.move(to: tip)
-                            line.addLine(to: CGPoint(x: tip.x - ux * 8 + uy * 4, y: tip.y - uy * 8 - ux * 4))
-                            let active = device.activities.contains { $0.sending == sending } || (sending ? device.signalSending : device.signalReceiving)
-                            context.stroke(line, with: .color(active ? .green : .secondary.opacity(0.45)), lineWidth: 1.5)
-                        }
-                    }
-                }
-                .accessibilityHidden(true)
-                .allowsHitTesting(false)
+                ConnectionLines(runtime: runtime, devices: devices,
+                    positions: Dictionary(uniqueKeysWithValues: devices.map { ($0.id, point($0, in: size)) }),
+                    mac: mac, macWidth: macWidth(size), macHeight: macHeight,
+                    nodeWidth: nodeWidth(size), nodeHeight: nodeHeight)
                 ForEach(devices) { device in
                     node(device, size: size).position(point(device, in: size))
                 }
@@ -83,8 +55,7 @@ struct ConnectionTopologyView: View {
                 .background(.background, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary.opacity(0.4)))
                 .overlay(alignment: .topTrailing) {
-                    Menu { Button("编辑", action: editMac) } label: { Image(systemName: "ellipsis") }
-                        .menuStyle(.borderlessButton).fixedSize().padding(8).disabled(busy || !connectionManagementEnabled).accessibilityLabel("编辑")
+                    MacTopologyMenu(operations: operations, enabled: connectionManagementEnabled, edit: editMac)
                 }
                 .position(mac)
             }
@@ -114,19 +85,7 @@ struct ConnectionTopologyView: View {
                 Text(device.switching ? "切换中" : (device.route == .tcp ? "局域网传输" : "蓝牙传输"))
                     .font(.caption2).foregroundStyle(.secondary)
             }
-            VStack(spacing: 5) {
-                ForEach([true, false], id: \.self) { sending in
-                    let active = (device.connected && device.activities.contains { $0.sending == sending }) ||
-                        (device.handshaking && (sending ? device.signalSending : device.signalReceiving))
-                    let clipboard = sending && device.activities.contains { $0.sending && $0.kind != .file }
-                    Text(device.handshaking ? "握手包" : (clipboard ? "发送粘贴板中" : "数据传输中"))
-                        .font(.caption).lineLimit(1)
-                        .opacity(active ? 1 : 0)
-                        .accessibilityHidden(!active)
-                        .allowsHitTesting(false)
-                }
-            }
-            .frame(height: 40)
+            NodeTrafficStatus(runtime: runtime, device: device)
             Text("\(device.priority)").font(.caption2).foregroundStyle(.secondary)
         }
         .frame(width: nodeWidth(size), height: nodeHeight)
@@ -134,7 +93,6 @@ struct ConnectionTopologyView: View {
         .gesture(DragGesture(coordinateSpace: .named("topology"))
             .updating($gestureActive) { _, active, transaction in active = true; transaction.disablesAnimations = true }
             .onChanged { value in
-                guard !busy else { return }
                 if drag?.id != device.id {
                     let origin = point(device, in: size)
                     drag = DragSession(id: device.id, origin: origin, mouseStart: value.startLocation, center: origin)
@@ -144,7 +102,7 @@ struct ConnectionTopologyView: View {
                                             y: session.origin.y + value.location.y - session.mouseStart.y), size)
             }
             .onEnded { value in
-                guard !busy, let session = drag, session.id == device.id else { drag = nil; return }
+                guard let session = drag, session.id == device.id else { drag = nil; return }
                 let end = clamp(CGPoint(x: session.origin.x + value.location.x - session.mouseStart.x,
                                        y: session.origin.y + value.location.y - session.mouseStart.y), size)
                 let saved = NodePosition(x: end.x / max(1, size.width), y: end.y / max(1, size.height))
@@ -156,14 +114,8 @@ struct ConnectionTopologyView: View {
         .background(.background, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(device.connected ? Color.secondary.opacity(0.4) : .red, lineWidth: device.connected ? 1 : 2))
         .overlay(alignment: .topTrailing) {
-            Menu {
-                Button("连接") { connect(device.id) }.disabled(!connectionManagementEnabled)
-                Button("编辑") { edit(device.id) }.disabled(!connectionManagementEnabled)
-                Divider()
-                Button("上移") { move(device.id, false) }.disabled(device.priority == 1)
-                Button("下移") { move(device.id, true) }.disabled(device.priority == devices.count)
-            } label: { Image(systemName: "ellipsis") }
-            .menuStyle(.borderlessButton).fixedSize().padding(8).disabled(busy).accessibilityLabel("编辑")
+            DeviceTopologyMenu(device: device, count: devices.count, operations: operations,
+                enabled: connectionManagementEnabled, connect: connect, edit: edit, move: move)
         }
         .accessibilityAction(named: "上移") { move(device.id, false) }
         .accessibilityAction(named: "下移") { move(device.id, true) }
@@ -198,5 +150,112 @@ struct ConnectionTopologyView: View {
             missing[device.id] = NodePosition(x: center.x / size.width, y: center.y / size.height)
         }
         if !missing.isEmpty { place(missing) }
+    }
+}
+
+/// Packet updates invalidate the drawing layer, without invalidating the drag owner.
+private struct ConnectionLines: View {
+    var runtime: MacRuntime
+    let devices: [TopologyDevice]
+    let positions: [UUID: CGPoint]
+    let mac: CGPoint
+    let macWidth: CGFloat
+    let macHeight: CGFloat
+    let nodeWidth: CGFloat
+    let nodeHeight: CGFloat
+
+    var body: some View {
+        let outbound = runtime.packetTraffic.sending
+        let inbound = runtime.packetTraffic.receiving
+        let visible = runtime.packetTraffic.visible
+        let activities = runtime.activities
+        Canvas { context, _ in
+            for device in devices where device.connected || visible.contains(device.id) {
+                guard let end = positions[device.id] else { continue }
+                for sending in [true, false] {
+                    let origin = sending ? mac : end, target = sending ? end : mac
+                    let dx = target.x - origin.x, dy = target.y - origin.y
+                    let distance = max(1, hypot(dx, dy)), ux = dx / distance, uy = dy / distance
+                    let sourceHalfWidth = (sending ? macWidth : nodeWidth) / 2
+                    let targetHalfWidth = (sending ? nodeWidth : macWidth) / 2
+                    let sourceHalfHeight = (sending ? macHeight : nodeHeight) / 2
+                    let targetHalfHeight = (sending ? nodeHeight : macHeight) / 2
+                    let sourceMargin = min(sourceHalfWidth / max(0.001, abs(ux)), sourceHalfHeight / max(0.001, abs(uy))) + 2
+                    let targetMargin = min(targetHalfWidth / max(0.001, abs(ux)), targetHalfHeight / max(0.001, abs(uy))) + 2
+                    let start = CGPoint(x: origin.x + ux * sourceMargin - uy * 4, y: origin.y + uy * sourceMargin + ux * 4)
+                    let tip = CGPoint(x: target.x - ux * targetMargin - uy * 4, y: target.y - uy * targetMargin + ux * 4)
+                    guard distance > sourceMargin + targetMargin else { continue }
+                    var line = Path(); line.move(to: start); line.addLine(to: tip)
+                    // Both branches share the line's endpoint, color and Path.
+                    line.addLine(to: CGPoint(x: tip.x - ux * 8 - uy * 4, y: tip.y - uy * 8 + ux * 4))
+                    line.move(to: tip)
+                    line.addLine(to: CGPoint(x: tip.x - ux * 8 + uy * 4, y: tip.y - uy * 8 - ux * 4))
+                    let active = device.profile.identity.flatMap { activities[$0] }?.contains { $0.sending == sending } == true ||
+                        (sending ? outbound.contains(device.id) : inbound.contains(device.id))
+                    context.stroke(line, with: .color(active ? .green : .secondary.opacity(0.45)), lineWidth: 1.5)
+                }
+            }
+        }
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
+}
+
+private struct NodeTrafficStatus: View {
+    var runtime: MacRuntime
+    let device: TopologyDevice
+
+    var body: some View {
+        let activities = device.profile.identity.flatMap { runtime.activities[$0] } ?? []
+        let handshaking = runtime.handshaking.contains(device.id)
+        let outbound = runtime.packetTraffic.sending.contains(device.id)
+        let inbound = runtime.packetTraffic.receiving.contains(device.id)
+        VStack(spacing: 5) {
+            ForEach([true, false], id: \.self) { sending in
+                let active = (device.connected && activities.contains { $0.sending == sending }) ||
+                    (handshaking && (sending ? outbound : inbound))
+                let clipboard = sending && activities.contains { $0.sending && $0.kind != .file }
+                Text(handshaking ? "握手包" : (clipboard ? "发送粘贴板中" : "数据传输中"))
+                    .font(.caption).lineLimit(1)
+                    .opacity(active ? 1 : 0)
+                    .accessibilityHidden(!active)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(height: 40)
+    }
+}
+
+private struct MacTopologyMenu: View {
+    let operations: ViewOperations
+    let enabled: Bool
+    let edit: () -> Void
+
+    var body: some View {
+        Menu { Button("编辑", action: edit) } label: { Image(systemName: "ellipsis") }
+            .menuStyle(.borderlessButton).fixedSize().padding(8)
+            .disabled(operations.busy([]) || !enabled).accessibilityLabel("编辑")
+    }
+}
+
+private struct DeviceTopologyMenu: View {
+    let device: TopologyDevice
+    let count: Int
+    let operations: ViewOperations
+    let enabled: Bool
+    let connect: (UUID) -> Void
+    let edit: (UUID) -> Void
+    let move: (UUID, Bool) -> Void
+
+    var body: some View {
+        Menu {
+            Button("连接") { connect(device.id) }.disabled(!enabled)
+            Button("编辑") { edit(device.id) }.disabled(!enabled)
+            Divider()
+            Button("上移") { move(device.id, false) }.disabled(device.priority == 1)
+            Button("下移") { move(device.id, true) }.disabled(device.priority == count)
+        } label: { Image(systemName: "ellipsis") }
+        .menuStyle(.borderlessButton).fixedSize().padding(8)
+        .disabled(operations.busy([.peer(device.id)])).accessibilityLabel("编辑")
     }
 }
