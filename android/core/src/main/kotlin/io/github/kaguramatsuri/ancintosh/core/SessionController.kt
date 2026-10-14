@@ -5,6 +5,8 @@ import java.nio.ByteBuffer
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
@@ -20,6 +22,7 @@ sealed interface SyncEvent {
     data class Configuration(val value: ManagedConfiguration, val json: String) : SyncEvent
     data class ConfigurationRejected(val request: UUID, val code: Failure) : SyncEvent
     data object ConfigurationReady : SyncEvent
+    data class Notification(val peer: UUID, val value: NotificationMessage) : SyncEvent
 }
 
 class SessionController(val identity: UUID, private val scope: CoroutineScope, private val store: TransferStore,
@@ -38,13 +41,62 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     var wifi = true; private set
     @Volatile private var remoteWifi = true
     @Volatile private var remoteConfiguration = false
+    @Volatile private var localNotificationAccess = NotificationAccess()
+    @Volatile private var remoteNotificationAccess: NotificationAccess? = null
+    @Volatile private var notificationsEnabled = false
+    private val notificationLock = Mutex()
+    private val notificationQueue = NotificationQueue()
+    private var notificationJob: Job? = null
+    private var notificationGeneration = UUID.randomUUID()
+    val sharesNotifications: Boolean get() = notificationsEnabled
     val connected: UUID? get() = peer
+    private fun preference(): ByteArray = JSONObject().put("enabled", wifi).put("configuration", true)
+        .put("notifications", localNotificationAccess.copy(enabled = notificationsEnabled).json()).bytes()
+    suspend fun notificationAccess(value: NotificationAccess) {
+        if (localNotificationAccess == value) return
+        localNotificationAccess = value
+        if (!value.capture) clearNotifications()
+        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
+    }
+    suspend fun notificationPolicy(enabled: Boolean) {
+        notificationsEnabled = enabled
+        if (!enabled) clearNotifications()
+        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
+    }
+    private suspend fun clearNotifications() = notificationLock.withLock {
+        notificationGeneration = UUID.randomUUID(); notificationJob?.cancel(); notificationJob = null; notificationQueue.clear()
+    }
+    suspend fun enqueueNotification(value: NotificationMessage) {
+        if (peer == null || !notificationsEnabled || !localNotificationAccess.capture || remoteNotificationAccess?.display != true) return
+        val current = ble
+        notificationLock.withLock { if (current === ble && notificationsEnabled && localNotificationAccess.capture) notificationQueue.append(value.validated()) }
+        pumpNotifications()
+    }
+    private suspend fun pumpNotifications(): Unit = notificationLock.withLock {
+        if (notificationJob != null || notificationQueue.size == 0 || awaitingFallback || remoteNotificationAccess?.enabled != true) return@withLock
+        val generation = notificationGeneration
+        notificationJob = scope.launch {
+            try {
+                while (peer != null && notificationsEnabled && localNotificationAccess.capture && remoteNotificationAccess?.display == true &&
+                    remoteNotificationAccess?.enabled == true && !awaitingFallback) {
+                    val value = notificationLock.withLock { if (generation == notificationGeneration) notificationQueue.pop() else null } ?: break
+                    val channel = tcp ?: ble ?: break
+                    channel.send(Record(RecordKind.NOTIFICATION, value.id, metadata = value.json().bytes(), epoch = epoch))
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { notificationLock.withLock { if (generation == notificationGeneration) notificationQueue.clear() } }
+            finally {
+                notificationLock.withLock { if (generation == notificationGeneration) notificationJob = null }
+                pumpNotifications()
+            }
+        }
+    }
     suspend fun outgoingFiles(): List<OutboundJob> = state.withLock { queue.filter { it.snapshot.manifest.kind == PayloadKind.FILE }.map { it.copy() } }
     suspend fun restore() = state.withLock { queue.addAll(store.restore()) }
 
     suspend fun installBLE(auth: Authentication, channel: EncryptedChannel) {
         ble?.close(); tcp?.close(); tcp = null; ble = channel; peer = auth.peer; offer = null
-        remoteConfiguration = false
+        remoteConfiguration = false; notificationsEnabled = false; remoteNotificationAccess = null; clearNotifications()
         val root = ByteBuffer.wrap(channel.root)
         epoch = UUID(root.long, root.long); awaitingFallback = false
         channel.setDataEpoch(epoch)
@@ -54,7 +106,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             queue.forEach { it.begun = false; it.waiting = false; it.finished = false }
         }
         scope.launch { readLoop(channel, false) }
-        channel.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", wifi).put("configuration", true).bytes()))
+        channel.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
         events(SyncEvent.Connected(auth.peer)); pump()
     }
     suspend fun installTCP(context: UUID, channel: EncryptedChannel) {
@@ -68,10 +120,10 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     suspend fun wifi(enabled: Boolean) {
         wifi = enabled
         if (!enabled && tcp != null) tcpLost()
-        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", enabled).put("configuration", true).bytes()))
+        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
         pump()
     }
-    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject().put("enabled", true).put("configuration", true).bytes())) }
+    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference())) }
     suspend fun reportDevice(information: DeviceInformation) {
         if (remoteConfiguration) ble?.send(Record(RecordKind.DEVICE_INFORMATION, metadata = information.json().bytes()))
     }
@@ -84,7 +136,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     suspend fun disconnect(intentional: Boolean = false) {
         val current = peer ?: return
         if (intentional) runCatching { ble?.send(Record(RecordKind.GOODBYE)) }
-        peer = null; ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
+        peer = null; clearNotifications(); remoteNotificationAccess = null; ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
         store.checkpoint(current); store.closeHandles(); reset(); events(SyncEvent.Disconnected(current, intentional))
     }
     suspend fun enqueue(snapshot: Snapshot) {
@@ -193,7 +245,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     private suspend fun receive(record: Record, channel: EncryptedChannel, isTCP: Boolean) {
         val current = peer ?: return
         val configurationFailure = record.kind == RecordKind.FAILURE && record.json().optBoolean("configuration", false)
-        val transfer = !configurationFailure && record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH, RecordKind.ACK, RecordKind.RESUME, RecordKind.CANCEL, RecordKind.FAILURE)
+        val transfer = !configurationFailure && record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH, RecordKind.ACK, RecordKind.RESUME, RecordKind.CANCEL, RecordKind.FAILURE, RecordKind.NOTIFICATION)
         if (transfer && (awaitingFallback || record.epoch != epoch || channel !== (tcp ?: ble))) return
         try {
             when (record.kind) {
@@ -234,6 +286,8 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 RecordKind.WIFI_PREFERENCE -> {
                     if (isTCP) fail(Failure.invalidFrame)
                     remoteWifi = record.json().getBoolean("enabled")
+                    remoteNotificationAccess = record.json().optJSONObject("notifications")?.let(NotificationAccess::decode)
+                    if (remoteNotificationAccess?.display != true) clearNotifications()
                     val ready = record.json().optBoolean("configuration", false)
                     if (ready && !remoteConfiguration) { remoteConfiguration = true; events(SyncEvent.ConfigurationReady) }
                     if (!remoteWifi) tcpLost()
@@ -274,6 +328,13 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                     if (value.mac.id != current) fail(Failure.authenticationFailed)
                     events(SyncEvent.Configuration(value, record.metadata.toString(Charsets.UTF_8)))
                 }
+                RecordKind.NOTIFICATION -> {
+                    if (remoteNotificationAccess == null) fail(Failure.invalidFrame)
+                    if (!notificationsEnabled || !localNotificationAccess.display) return
+                    val value = NotificationMessage.decode(record.json())
+                    if (value.id != record.id || record.offset != 0L || record.bytes.isNotEmpty()) fail(Failure.invalidFrame)
+                    events(SyncEvent.Notification(current, value))
+                }
                 RecordKind.DEVICE_INFORMATION -> fail(Failure.invalidFrame)
             }
         } catch (error: ProtocolException) {
@@ -289,6 +350,6 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 events(SyncEvent.Failed(record.id, code))
             } else throw error
         }
-        pump()
+        pump(); pumpNotifications()
     }
 }

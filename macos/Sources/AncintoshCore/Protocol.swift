@@ -13,7 +13,7 @@ public enum PayloadKind: Int, Codable, Sendable { case text = 1, image = 2, file
 public enum RecordKind: UInt8, Sendable {
     case begin = 1, data = 2, finish = 3, acknowledge = 4, resume = 5
     case cancel = 6, wifiPreference = 7, tcpOffer = 8, goodbye = 9, failure = 10, transportSwitch = 11
-    case deviceInformation = 12, configuration = 13
+    case deviceInformation = 12, configuration = 13, notification = 14
 }
 
 public enum Wire {

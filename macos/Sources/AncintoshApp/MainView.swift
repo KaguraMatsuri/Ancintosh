@@ -5,7 +5,6 @@ import SwiftUI
 
 struct MainView: View {
     @Bindable var runtime: MacRuntime
-    var demo: TopologyDemo? = nil
     @State private var dividerReady = false
     @State private var editing: PeerProfile?
     @State private var editingMac = false
@@ -19,7 +18,7 @@ struct MainView: View {
 
     var body: some View {
         HSplitView {
-            settings.disabled(demo != nil).frame(minWidth: dividerReady ? 280 : 320, idealWidth: 320,
+            settings.frame(minWidth: dividerReady ? 280 : 320, idealWidth: 320,
                 maxWidth: dividerReady ? 420 : 320, maxHeight: .infinity)
             GeometryReader { geometry in
                 ScrollView {
@@ -33,6 +32,7 @@ struct MainView: View {
         }
         .onAppear {
             runtime.refreshPermissions(); resetLockDelayDraft()
+            if runtime.isDemonstration { runtime.start() }
             // Seed the native divider once before allowing the full drag range.
             DispatchQueue.main.async { dividerReady = true }
         }
@@ -87,11 +87,57 @@ struct MainView: View {
                         if let identity = profile.identity { Text(profile.name ?? identity.uuidString).tag(Optional(identity)) }
                     }
                 }
+                #if DEBUG
+                if runtime.isDemonstration {
+                    HStack {
+                        Button("验证") { if let selected { perform { try await runtime.verify(selected) } } }
+                        Menu("测试") {
+                            ForEach(DemonstrationTest.allCases, id: \.self) { test in
+                                Button(test.rawValue) {
+                                    guard let selected else { return }
+                                    if test == .file { chooseFiles() }
+                                    else { perform { try await runtime.test(test, peer: selected) } }
+                                }
+                            }
+                        }
+                    }.disabled(selected == nil || busy || runtime.isTesting)
+                }
+                #endif
                 Button(runtime.preparing ? "准备文件中…" : "发送文件") { chooseFiles() }
                     .disabled(busy || runtime.preparing || selected.map { !runtime.connected.contains($0) } != false)
                     .accessibilityLabel(runtime.preparing ? "准备文件中…" : "发送文件")
                 Text("接收文件保存到下载目录中的 Ancintosh 文件夹。").foregroundStyle(.secondary)
             }
+            Section("共享通知") {
+                ForEach(runtime.configuration.peers) { profile in
+                    Toggle(profile.name ?? profile.id.uuidString, isOn: Binding(get: { profile.notifications == true },
+                        set: { enabled in perform { try await runtime.shareNotifications(profile.id, enabled: enabled) } }))
+                        .disabled(busy)
+                }
+                if runtime.configuration.peers.contains(where: { $0.notifications == true }) && !runtime.notificationAllowed && !runtime.isDemonstration {
+                    Text(Copy.failure(ProtocolFailure.permissionDenied))
+                    Button("打开系统设置") { openSystemSettings() }
+                }
+            }
+            #if DEBUG
+            if runtime.isDemonstration {
+                Section("测试") {
+                    TextEditor(text: Binding(get: { runtime.demonstrationText }, set: { runtime.demonstrationText = $0 }))
+                        .frame(minHeight: 64).accessibilityLabel("同步")
+                    if !runtime.demonstrationReceivedText.isEmpty { Text(runtime.demonstrationReceivedText).textSelection(.enabled) }
+                    if let result = runtime.demonstrationResult {
+                        HStack {
+                            Text(runtime.configuration.peers.first(where: { $0.identity == result.peer })?.name ?? result.peer.uuidString)
+                            Text(result.test.rawValue)
+                            if result.passed == true { Image(systemName: "checkmark.circle").accessibilityLabel(result.test.rawValue) }
+                            else if let failure = result.failure { Text(Copy.failure(failure)) }
+                            else { ProgressView().accessibilityLabel(result.test.rawValue) }
+                        }
+                        if runtime.isTesting { Button("取消") { Task { await runtime.cancelTest() } } }
+                    }
+                }
+            }
+            #endif
             if !runtime.transfers.isEmpty {
                 Section("文件传输") {
                     ForEach(runtime.transfers.values.sorted { $0.id.uuidString < $1.id.uuidString }) { transfer in
@@ -158,27 +204,24 @@ struct MainView: View {
 
     private var topology: some View {
         ConnectionTopologyView(macName: runtime.configuration.name,
-            devices: demo?.devices ?? runtime.configuration.peers.enumerated().map { index, profile in
+            devices: runtime.configuration.peers.enumerated().map { index, profile in
                 let peer = profile.identity
                 return TopologyDevice(profile: profile, priority: index + 1,
                     connected: peer.map { runtime.connected.contains($0) } == true,
                     route: peer.flatMap { runtime.routes[$0] }, switching: peer.map { runtime.switching.contains($0) } == true,
                     activities: peer.flatMap { runtime.activities[$0] } ?? [], position: runtime.configuration.nodePositions[profile.id.uuidString],
                     signalSending: runtime.packetTraffic.sending.contains(profile.id), signalReceiving: runtime.packetTraffic.receiving.contains(profile.id),
-                    communicating: runtime.packetTraffic.visible.contains(profile.id))
-            }, busy: busy, connectionManagementEnabled: demo == nil,
+                    communicating: runtime.packetTraffic.visible.contains(profile.id), handshaking: runtime.handshaking.contains(profile.id))
+            }, busy: busy,
             editMac: { macNameDraft = runtime.configuration.name; macNameError = nil; editingMac = true },
             connect: { id in
                 guard let profile = runtime.configuration.peers.first(where: { $0.id == id }) else { return }
                 do { try runtime.connect(profile) } catch { self.error = Copy.failure(error) }
             }, edit: { id in editing = runtime.configuration.peers.first(where: { $0.id == id }) },
-            move: movePeer, place: { positions in
-                if let demo { demo.place(positions) } else { runtime.placeNodes(positions) }
-            })
+            move: movePeer, place: runtime.placeNodes)
     }
 
     private func movePeer(_ id: UUID, down: Bool) {
-        if let demo { demo.move(id, down: down); return }
         guard !busy, let index = runtime.configuration.peers.firstIndex(where: { $0.id == id }),
               down ? index + 1 < runtime.configuration.peers.count : index > 0 else { return }
         runtime.movePeers(from: IndexSet(integer: index), to: down ? index + 2 : index - 1)
@@ -212,7 +255,7 @@ struct MainView: View {
     private func openSystemSettings() { NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app")) }
     private func perform(_ action: @escaping @MainActor () async throws -> Void) {
         busy = true
-        Task { defer { busy = false }; do { try await action() } catch { self.error = Copy.failure(error) } }
+        Task { defer { busy = false }; do { try await action() } catch is CancellationError { } catch { self.error = Copy.failure(error) } }
     }
     private func chooseFiles() {
         guard let selected else { return }

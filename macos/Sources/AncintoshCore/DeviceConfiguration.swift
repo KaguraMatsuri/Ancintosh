@@ -7,8 +7,10 @@ public struct DeviceInformation: Codable, Sendable {
     public let kind: DeviceKind
     public let wifi: Bool
     public let renameRequest: UUID?
-    public init(name: String, kind: DeviceKind, wifi: Bool, renameRequest: UUID? = nil) {
+    public let notificationAccess: NotificationAccess?
+    public init(name: String, kind: DeviceKind, wifi: Bool, renameRequest: UUID? = nil, notificationAccess: NotificationAccess? = nil) {
         self.name = name; self.kind = kind; self.wifi = wifi; self.renameRequest = renameRequest
+        self.notificationAccess = notificationAccess
     }
 }
 
@@ -19,9 +21,11 @@ public struct ManagedDevice: Codable, Sendable {
     public let wifi: Bool
     public let priority: Int
     public let renameRequest: UUID?
-    public init(id: UUID, name: String, kind: DeviceKind, wifi: Bool, priority: Int, renameRequest: UUID? = nil) {
+    public let notifications: Bool?
+    public init(id: UUID, name: String, kind: DeviceKind, wifi: Bool, priority: Int, renameRequest: UUID? = nil, notifications: Bool? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.wifi = wifi
         self.priority = priority; self.renameRequest = renameRequest
+        self.notifications = notifications
     }
 }
 

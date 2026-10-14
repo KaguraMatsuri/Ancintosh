@@ -10,6 +10,9 @@ public enum SyncEvent: Sendable {
     case completed(UUID, UUID)
     case transportChanged(UUID, TransportKind?)
     case deviceInformation(UUID, DeviceInformation)
+    case notificationAccess(UUID, NotificationAccess?)
+    case notification(UUID, NotificationMessage)
+    case configuration(UUID, ManagedConfiguration), configurationReady(UUID)
     case transferStarted(UUID, TransferManifest, sending: Bool)
     case transferStopped(UUID, UUID)
 }
@@ -17,7 +20,10 @@ public enum SyncEvent: Sendable {
 private struct Preference: Codable {
     let enabled: Bool
     let configuration: Bool?
-    init(enabled: Bool, configuration: Bool? = true) { self.enabled = enabled; self.configuration = configuration }
+    let notifications: NotificationAccess?
+    init(enabled: Bool, configuration: Bool? = true, notifications: NotificationAccess = NotificationAccess()) {
+        self.enabled = enabled; self.configuration = configuration; self.notifications = notifications
+    }
 }
 private struct Acknowledgement: Codable { let complete: Bool }
 private struct FailureMessage: Codable {
@@ -36,6 +42,8 @@ private struct PeerChannels {
     var epoch = Wire.zeroID
     var switching = false
     var supportsConfiguration = false
+    var notificationAccess: NotificationAccess?
+    var notificationsEnabled = false
 }
 
 public actor SyncCoordinator {
@@ -53,6 +61,11 @@ public actor SyncCoordinator {
     private var activeJobs: [UUID: UUID] = [:]
     private var activeCancelled: Set<UUID> = []
     private var lastProgress: [UUID: ContinuousClock.Instant] = [:]
+    private var localNotificationAccess = NotificationAccess()
+    private var notificationQueues: [UUID: NotificationQueue] = [:]
+    private var notificationOrder: [(UUID, UUID)] = []
+    private var notificationWorkers: [UUID: Task<Void, Never>] = [:]
+    private var notificationGenerations: [UUID: UUID] = [:]
 
     public init(identity: UUID, role: PeerRole, store: TransferStore,
                 events: @escaping @Sendable (SyncEvent) async throws -> Void) {
@@ -77,8 +90,73 @@ public actor SyncCoordinator {
         let channel = entry.ble
         try await channel.send(Record(.configuration, metadata: Wire.encodeJSON(value)))
     }
+    public func reportDevice(_ value: DeviceInformation, to peer: UUID) async throws {
+        guard role == .android, let entry = peers[peer], entry.supportsConfiguration else { throw ProtocolFailure.peerUnavailable }
+        try await entry.ble.send(Record(.deviceInformation, metadata: Wire.encodeJSON(value)))
+    }
+
+    public func notificationAccess(_ value: NotificationAccess) async {
+        guard value != localNotificationAccess else { return }
+        localNotificationAccess = value
+        for (peer, entry) in peers {
+            if !value.capture { clearNotifications(peer) }
+            try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: NotificationAccess(capture: value.capture, display: value.display, enabled: entry.notificationsEnabled)))))
+        }
+    }
+    public func notificationPolicy(_ peer: UUID, enabled: Bool) async {
+        guard var entry = peers[peer] else { return }
+        entry.notificationsEnabled = enabled; peers[peer] = entry
+        if !enabled { clearNotifications(peer) }
+        let access = NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: enabled)
+        try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: access))))
+    }
+    public func enqueueNotification(_ value: NotificationMessage, to peer: UUID) throws {
+        guard let entry = peers[peer], entry.notificationsEnabled, entry.notificationAccess?.display == true,
+              localNotificationAccess.capture else { return }
+        let value = try value.validated()
+        if notificationQueues[peer]?.contains(value.id) != true { notificationOrder.append((peer, value.id)) }
+        notificationQueues[peer, default: NotificationQueue()].append(value)
+        if notificationOrder.count > NotificationQueue.capacity {
+            let oldest = notificationOrder.removeFirst(); notificationQueues[oldest.0]?.remove(oldest.1)
+        }
+        scheduleNotifications(peer)
+    }
+    private func clearNotifications(_ peer: UUID) {
+        notificationWorkers.removeValue(forKey: peer)?.cancel()
+        notificationQueues.removeValue(forKey: peer); notificationGenerations.removeValue(forKey: peer)
+        notificationOrder.removeAll { $0.0 == peer }
+    }
+    private func scheduleNotifications(_ peer: UUID) {
+        guard notificationWorkers[peer] == nil, let entry = peers[peer], !entry.switching,
+              entry.notificationAccess?.enabled == true, (notificationQueues[peer]?.count ?? 0) > 0 else { return }
+        let generation = UUID(), session = entry.generation
+        notificationGenerations[peer] = generation
+        notificationWorkers[peer] = Task {
+            defer {
+                if self.notificationGenerations[peer] == generation {
+                    self.notificationWorkers.removeValue(forKey: peer); self.notificationGenerations.removeValue(forKey: peer)
+                    self.scheduleNotifications(peer)
+                }
+            }
+            while !Task.isCancelled, self.notificationGenerations[peer] == generation,
+                  let current = self.peers[peer], current.generation == session, !current.switching,
+                  current.notificationsEnabled, current.notificationAccess?.display == true, current.notificationAccess?.enabled == true, self.localNotificationAccess.capture,
+                  let value = self.notificationQueues[peer]?.pop() {
+                self.notificationOrder.removeAll { $0.0 == peer && $0.1 == value.id }
+                do {
+                    try await (current.tcp ?? current.ble).send(Record(.notification, transferID: value.id,
+                        metadata: Wire.encodeJSON(value), epoch: current.epoch))
+                } catch {
+                    self.notificationQueues.removeValue(forKey: peer)
+                    self.notificationOrder.removeAll { $0.0 == peer }
+                    break
+                }
+            }
+        }
+    }
 
     public func installBLE(_ peer: UUID, channel: EncryptedChannel) async throws {
+        clearNotifications(peer)
         if let previous = peers.removeValue(forKey: peer) { await previous.ble.close(); await previous.tcp?.close() }
         var entry = PeerChannels(ble: channel, generation: UUID())
         var epochReader = BinaryReader(Data(channel.root.prefix(16)))
@@ -91,9 +169,10 @@ public actor SyncCoordinator {
         scheduler.reconnect(peer)
         let generation = entry.generation
         Task { await self.readLoop(peer, channel: channel, generation: generation, tcp: false) }
-        try await channel.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi))))
+        try await channel.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: false)))))
         try await events(.connected(peer))
         schedulePump()
+        scheduleNotifications(peer)
     }
 
     public func offerTCP(_ peer: UUID, addresses: [TCPAddress]) async throws -> TCPOffer {
@@ -157,7 +236,7 @@ public actor SyncCoordinator {
             entry.route.preference(local: enabled)
             peers[id] = entry
             if !enabled { await fallback(id) }
-            try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: enabled))))
+            try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: enabled, notifications: NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: entry.notificationsEnabled)))))
         }
         schedulePump()
     }
@@ -171,13 +250,14 @@ public actor SyncCoordinator {
 
     public func disconnect(_ peer: UUID, intentional: Bool = false) async {
         guard let entry = peers.removeValue(forKey: peer) else { return }
+        clearNotifications(peer)
         pumps[peer]?.cancel()
         try? await store.checkpoint(peer)
         await entry.ble.close(); await entry.tcp?.close()
         if peers.isEmpty { await store.closeHandles() }
         scheduler.reconnect(peer)
         try? await store.persistOutgoing(scheduler.jobs)
-        try? await events(.disconnected(peer, intentional: intentional))
+        if peers[peer] == nil { try? await events(.disconnected(peer, intentional: intentional)) }
     }
 
     public func enqueue(_ snapshot: Snapshot, targets: [UUID], userInitiated: Bool) async throws {
@@ -233,7 +313,8 @@ public actor SyncCoordinator {
     }
 
     private func receive(_ record: Record, from peer: UUID, channel: EncryptedChannel, tcp: Bool) async throws {
-        let isTransfer = [.begin, .data, .finish, .acknowledge, .resume, .cancel, .failure].contains(record.kind)
+        let configurationFailure = record.kind == .failure && (try? Wire.decodeJSON(FailureMessage.self, record.metadata).configuration) == true
+        let isTransfer = !configurationFailure && [.begin, .data, .finish, .acknowledge, .resume, .cancel, .failure, .notification].contains(record.kind)
         if isTransfer && (peers[peer]?.switching != false || record.epoch != peers[peer]?.epoch || channel !== dataChannel(peer)) { return }
         do {
             switch record.kind {
@@ -294,7 +375,13 @@ public actor SyncCoordinator {
                 guard !tcp, var entry = peers[peer] else { throw ProtocolFailure.invalidFrame }
                 let preference = try Wire.decodeJSON(Preference.self, record.metadata)
                 entry.route.preference(remote: preference.enabled)
+                entry.notificationAccess = preference.notifications
+                let configurationReady = preference.configuration == true && !entry.supportsConfiguration
+                entry.supportsConfiguration = preference.configuration == true
                 peers[peer] = entry
+                if preference.notifications?.display != true { clearNotifications(peer) }
+                try await events(.notificationAccess(peer, preference.notifications))
+                if configurationReady { try await events(.configurationReady(peer)) }
                 if !preference.enabled { await fallback(peer) }
                 try await events(.wifiChanged(peer, preference.enabled))
             case .tcpOffer:
@@ -346,7 +433,17 @@ public actor SyncCoordinator {
                         metadata: Wire.encodeJSON(FailureMessage(code: failure, configuration: true))))
                 }
             case .configuration:
-                throw ProtocolFailure.invalidFrame
+                guard role == .android, !tcp else { throw ProtocolFailure.invalidFrame }
+                let value = try Wire.decodeJSON(ManagedConfiguration.self, record.metadata)
+                guard value.mac.id == peer, value.mac.kind == .mac, value.revision >= 0,
+                      (1...3600).contains(value.lockDelaySeconds), value.device?.kind != .mac else { throw ProtocolFailure.invalidFrame }
+                try await events(.configuration(peer, value))
+            case .notification:
+                guard let entry = peers[peer], entry.notificationAccess != nil else { throw ProtocolFailure.invalidFrame }
+                guard entry.notificationsEnabled, localNotificationAccess.display else { return }
+                let value = try Wire.decodeJSON(NotificationMessage.self, record.metadata).validated()
+                guard value.id == record.transferID, record.offset == 0, record.bytes.isEmpty else { throw ProtocolFailure.invalidFrame }
+                try await events(.notification(peer, value))
             }
         } catch let failure as ProtocolFailure {
             if isTransfer && record.epoch != peers[peer]?.epoch { return }
@@ -363,9 +460,11 @@ public actor SyncCoordinator {
             } else { throw error }
         }
         schedulePump()
+        scheduleNotifications(peer)
     }
 
     private func schedulePump() {
+        for peer in peers.keys { scheduleNotifications(peer) }
         let available = Set(peers.filter { !$0.value.switching }.keys)
         let filePeer = scheduler.firstFilePeer(available: available)
         var seen: Set<UUID> = []

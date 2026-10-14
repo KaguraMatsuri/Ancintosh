@@ -1,0 +1,5 @@
+{
+  "upsert": { "id": "00112233-4455-4677-8899-aabbccddeeff", "action": "upsert", "application": "Galaxy S24 Ultra", "title": "Ciallo~", "body": "Galaxy Tab S8 Plus" },
+  "remove": { "id": "00112233-4455-4677-8899-aabbccddeeff", "action": "remove", "application": "", "title": "", "body": "" },
+  "access": { "capture": true, "display": true, "enabled": true }
+}

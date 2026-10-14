@@ -42,6 +42,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         refreshNames()
         originalPermissionNeeded = settings.originalPermissionNeeded
         hasKey = settings.hasKey; mac = settings.mac?.toString()
+        service?.let { running -> viewModelScope.launch { running.refreshNotificationAccess(); running.reportDevice() } }
         if (service == null && !busy) viewModelScope.launch { attach(false) }
     }
     private suspend fun attach(reportFailure: Boolean) {

@@ -21,6 +21,8 @@ import io.github.kaguramatsuri.ancintosh.ui.MainActivity
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,10 +38,14 @@ class SyncService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val preparation = Mutex()
     private val deviceReporting = Mutex()
+    private val notificationReporting = Mutex()
     private var startup: Job? = null
     private lateinit var peripheral: BLEPeripheral
     private lateinit var tcp: TCPClient
     private lateinit var settings: DeviceSettings
+    private lateinit var notificationMirror: NotificationMirror
+    private val notificationInput = Channel<NotificationEnvelope>(128, BufferOverflow.DROP_OLDEST)
+    private var notificationPolicy = false
     lateinit var session: SessionController; private set
     lateinit var files: FileAccess; private set
     private val mutableStatus = MutableStateFlow(SyncStatus())
@@ -66,6 +72,7 @@ class SyncService : Service() {
         super.onCreate()
         foregroundNotification()
         settings = DeviceSettings(this)
+        notificationMirror = NotificationMirror(this)
         val store = TransferStore(File(filesDir, "state"), stagedPublish = { file, manifest, check, commit ->
             FileAccess.publish(this, file, manifest, commit, check)
         }) { file, manifest -> FileAccess.publish(this, file, manifest) }
@@ -74,10 +81,14 @@ class SyncService : Service() {
             if (event is SyncEvent.Connected && session.connected != event.peer) return@SessionController
             if (event is SyncEvent.Disconnected && session.connected != null) return@SessionController
             if (event is SyncEvent.Delivered) files.apply(event.result)
-            if (event is SyncEvent.Disconnected && ::peripheral.isInitialized) peripheral.sessionDisconnected()
+            if (event is SyncEvent.Disconnected && ::peripheral.isInitialized) { peripheral.sessionDisconnected(); refreshNotificationAccess() }
             if (event is SyncEvent.Offer) scope.launch { tcp.connect(event) }
             if (event is SyncEvent.Connected || event is SyncEvent.ConfigurationReady) reportDevice()
-            if (event is SyncEvent.Configuration) settings.applyConfiguration(event.value, event.json)
+            if (event is SyncEvent.Configuration) { settings.applyConfiguration(event.value, event.json); refreshNotificationAccess() }
+            if (event is SyncEvent.Notification) {
+                try { notificationMirror.apply(event.peer, event.value) }
+                catch (_: SecurityException) { mutableStatus.update { it.copy(failure = Failure.permissionDenied) }; refreshNotificationAccess() }
+            }
             if (event is SyncEvent.ConfigurationRejected) settings.rejectRename(event.request)
             mutableStatus.update { current ->
                 when (event) {
@@ -91,8 +102,10 @@ class SyncService : Service() {
                     else -> current
                 }
             }
-            events.emit(event)
+            if (event !is SyncEvent.Notification) events.emit(event)
         }
+        scope.launch { for (value in notificationInput) if (NotificationBridge.target() === value.target) session.enqueueNotification(value.value) }
+        scope.launch { NotificationBridge.changes.collect { refreshNotificationAccess() } }
         tcp = TCPClient(this, scope, session)
         peripheral = BLEPeripheral(this, scope, settings, session) { code ->
             mutableStatus.update { it.copy(failure = code) }
@@ -115,7 +128,21 @@ class SyncService : Service() {
     }
     suspend fun reportDevice() = deviceReporting.withLock {
         val kind = if (resources.configuration.smallestScreenWidthDp >= 600) DeviceKind.pad else DeviceKind.phone
-        session.reportDevice(settings.information(kind))
+        refreshNotificationAccess()
+        session.reportDevice(settings.information(kind).copy(notificationAccess = currentNotificationAccess()))
+    }
+    private fun currentNotificationAccess(): NotificationAccess = NotificationAccess(
+        capture = NotificationBridge.connected && NotificationBridge.allowed(this), display = notificationMirror.permitted)
+    suspend fun refreshNotificationAccess(): Unit = notificationReporting.withLock {
+        val access = currentNotificationAccess()
+        val enabled = status.value.running && settings.notifications && session.connected != null
+        session.notificationAccess(access)
+        if (notificationPolicy != enabled || session.sharesNotifications != enabled) {
+            notificationPolicy = enabled
+            session.notificationPolicy(enabled)
+            if (!enabled) settings.mac?.let(notificationMirror::clear)
+        }
+        NotificationBridge.bind(if (enabled && access.capture) notificationInput else null)
     }
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -198,6 +225,7 @@ class SyncService : Service() {
     }
     fun cancelAsync(id: UUID) { scope.launch { runCatching { cancel(id) } } }
     suspend fun stopSync() {
+        if (NotificationBridge.target()?.channel === notificationInput) NotificationBridge.bind(null)
         startup?.cancelAndJoin()
         mutableStatus.update { it.copy(running = false, ready = false) }
         peripheral.stop()?.join(); session.disconnect(true); tcp.stop()
@@ -207,6 +235,8 @@ class SyncService : Service() {
         mutableStatus.update { it.copy(failure = (error as? ProtocolException)?.code ?: if (error is SecurityException) Failure.permissionDenied else Failure.sourceUnavailable) }
     }
     override fun onDestroy() {
+        if (NotificationBridge.target()?.channel === notificationInput) NotificationBridge.bind(null)
+        notificationInput.close()
         if (::peripheral.isInitialized) peripheral.stop()
         if (::tcp.isInitialized) tcp.stop()
         runCatching { unregisterReceiver(radio) }

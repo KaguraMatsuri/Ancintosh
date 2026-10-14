@@ -22,6 +22,9 @@
             </intent-filter>
         </activity>
         <service android:name=".platform.SyncService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <service android:name=".platform.NotificationListener" android:exported="true" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:label="@string/share_notifications">
+            <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+        </service>
         <service android:name=".platform.SyncTileService" android:exported="true" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:label="@string/sync" android:icon="@android:drawable/stat_notify_sync">
             <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
         </service>

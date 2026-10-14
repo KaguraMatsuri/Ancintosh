@@ -30,7 +30,7 @@ fun AncintoshTheme(content: @Composable () -> Unit) {
 
 @Composable
 fun SettingsScreen(model: SettingsViewModel, start: () -> Unit, sendFiles: () -> Unit, addTile: () -> Unit,
-                   originalPermission: () -> Unit, notificationPermission: () -> Unit) {
+                   originalPermission: () -> Unit, notificationPermission: () -> Unit, notificationAccess: () -> Unit) {
     val state by model.status.collectAsStateWithLifecycle()
     val context = LocalContext.current
     Scaffold { insets ->
@@ -81,6 +81,7 @@ fun SettingsScreen(model: SettingsViewModel, start: () -> Unit, sendFiles: () ->
             item {
                 Text(stringResource(R.string.operations), style = MaterialTheme.typography.titleMedium)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(onClick = notificationAccess) { Text(stringResource(R.string.share_notifications)) }
                     FilledTonalButton(onClick = addTile) { Text(stringResource(R.string.add_tile)) }
                     FilledTonalButton(onClick = sendFiles, enabled = state.ready && state.peer != null && !state.preparing && !model.busy) {
                         Text(stringResource(if (state.preparing) R.string.preparing else R.string.send_files))

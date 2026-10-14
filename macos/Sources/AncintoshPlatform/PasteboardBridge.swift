@@ -4,7 +4,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 @MainActor
-public final class PasteboardBridge: NSObject {
+public final class PasteboardBridge: NSObject, ClipboardAccess {
     public var changed: ((URL?, String?, String?) -> Void)?
     private let pasteboard = NSPasteboard.general
     private var count = NSPasteboard.general.changeCount

@@ -42,6 +42,7 @@ class DeviceSettings(context: Context) {
     }
     val name: String get() = prefs.getString("pendingName", null) ?: prefs.getString("name", null) ?: systemName
     val renameRequest: UUID? get() = prefs.getString("renameRequest", null)?.let(UUID::fromString)
+    val notifications: Boolean get() = prefs.getBoolean("notifications", false)
     val macName: String? get() = prefs.getString("macName", null)
     fun information(kind: DeviceKind): DeviceInformation = synchronized(configurationLock) {
         DeviceInformation(name, kind, wifi, renameRequest)
@@ -70,7 +71,7 @@ class DeviceSettings(context: Context) {
             val previous = prefs.getString(storage, null)?.let { JSONObject(it).getLong("revision") } ?: -1
             if (value.revision >= previous) {
                 editor.putString(storage, json)
-                if (device.id == identity) editor.putString("name", device.name)
+                if (device.id == identity) editor.putString("name", device.name).putBoolean("notifications", device.notifications)
             }
             if (device.id == identity && renameRequest != null && device.renameRequest == renameRequest) {
                 editor.remove("pendingName").remove("renameRequest")

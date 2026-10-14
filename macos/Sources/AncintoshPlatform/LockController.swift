@@ -12,13 +12,15 @@ public final class LockController {
     private var activity: NSObjectProtocol?
     private let authorizationCheck: () -> Bool
     private let authorizationRequest: () -> Bool
+    private let lockAction: (() -> Void)?
     public private(set) var authorizationRequested = false
     public convenience init() {
         self.init(authorizationCheck: { CGPreflightPostEventAccess() }, authorizationRequest: { CGRequestPostEventAccess() })
     }
-    init(authorizationCheck: @escaping () -> Bool, authorizationRequest: @escaping () -> Bool) {
+    init(authorizationCheck: @escaping () -> Bool, authorizationRequest: @escaping () -> Bool, lockAction: (() -> Void)? = nil) {
         self.authorizationCheck = authorizationCheck
         self.authorizationRequest = authorizationRequest
+        self.lockAction = lockAction
     }
     public var permitted: Bool { authorizationCheck() }
     public func setDelay(seconds: Int) throws { try state.setDelay(seconds: seconds) }
@@ -54,6 +56,7 @@ public final class LockController {
     }
     private func lock() {
         guard permitted else { return }
+        if let lockAction { lockAction(); return }
         for down in [true, false] {
             let event = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: down)
             event?.flags = [.maskControl, .maskCommand]

@@ -9,6 +9,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.os.Bundle
+import android.provider.Settings
+import io.github.kaguramatsuri.ancintosh.platform.NotificationListener
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -27,7 +29,7 @@ class MainActivity : ComponentActivity() {
         if (grants[Manifest.permission.BLUETOOTH_CONNECT] == true && grants[Manifest.permission.BLUETOOTH_ADVERTISE] == true) startWithBluetooth()
         else model.error = R.string.error_permission
     }
-    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed -> if (!allowed) model.error = R.string.error_permission; model.refresh() }
     private val original = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         if (allowed) model.originalPermissionGranted() else model.error = R.string.error_permission
     }
@@ -45,6 +47,9 @@ class MainActivity : ComponentActivity() {
                         Icon.createWithResource(this, android.R.drawable.stat_notify_sync), mainExecutor) { }
                 }, originalPermission = { original.launch(Manifest.permission.ACCESS_MEDIA_LOCATION) }, notificationPermission = {
                     notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }, notificationAccess = {
+                    startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS).putExtra(
+                        Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME, ComponentName(this, NotificationListener::class.java).flattenToString()))
                 })
             }
         }

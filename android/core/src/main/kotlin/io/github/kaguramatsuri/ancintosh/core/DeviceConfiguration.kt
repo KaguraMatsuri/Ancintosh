@@ -4,17 +4,18 @@ import java.util.UUID
 import org.json.JSONObject
 
 enum class DeviceKind { mac, phone, pad }
-data class DeviceInformation(val name: String, val kind: DeviceKind, val wifi: Boolean, val renameRequest: UUID? = null) {
+data class DeviceInformation(val name: String, val kind: DeviceKind, val wifi: Boolean, val renameRequest: UUID? = null, val notificationAccess: NotificationAccess? = null) {
     fun json(): JSONObject = JSONObject().put("name", name).put("kind", kind.name).put("wifi", wifi)
         .apply { renameRequest?.let { put("renameRequest", it.toString()) } }
+        .apply { notificationAccess?.let { put("notificationAccess", it.json()) } }
 }
 data class ManagedDevice(val id: UUID, val name: String, val kind: DeviceKind, val wifi: Boolean,
-                         val priority: Int, val renameRequest: UUID?) {
+                         val priority: Int, val renameRequest: UUID?, val notifications: Boolean = false) {
     companion object {
         fun decode(j: JSONObject): ManagedDevice {
             val priority = j.getInt("priority"); if (priority < 0) fail(Failure.invalidFrame)
             return ManagedDevice(UUID.fromString(j.getString("id")), j.getString("name"), DeviceKind.valueOf(j.getString("kind")),
-                j.getBoolean("wifi"), priority, j.optionalUUID("renameRequest"))
+                j.getBoolean("wifi"), priority, j.optionalUUID("renameRequest"), j.optBoolean("notifications", false))
         }
     }
 }
