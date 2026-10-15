@@ -44,6 +44,7 @@ private actor EventRecorder {
     var sent: UInt64 = 0
     var errors: [ProtocolFailure] = []
     var routes: [UUID: TransportKind] = [:]
+    var wifiPreferences: [UUID: Bool] = [:]
     var information: [UUID: DeviceInformation] = [:]
     var active: Set<String> = []
     func record(_ event: SyncEvent) {
@@ -51,6 +52,7 @@ private actor EventRecorder {
         case .completed(let peer, let id): complete.insert(id); active.remove("\(peer)/\(id)/true")
         case .received(let peer, let manifest, let file): received[manifest.id] = file; active.remove("\(peer)/\(manifest.id)/false")
         case .transportChanged(let peer, let route): routes[peer] = route
+        case .wifiChanged(let peer, let enabled): wifiPreferences[peer] = enabled
         case .progress(_, _, let offset, _): sent = offset
         case .failed(_, _, let error): errors.append(error)
         case .deviceInformation(let peer, let value): information[peer] = value
@@ -201,6 +203,7 @@ private actor EventRecorder {
     let remoteBLE = EncryptedChannel(raw: b, authentication: right, transport: .ble)
     try await coordinator.installBLE(phone, channel: EncryptedChannel(raw: a, authentication: left, transport: .ble))
     #expect(try await remoteBLE.receive().kind == .wifiPreference)
+    try await remoteBLE.send(Record(.wifiPreference, metadata: Data("{\"enabled\":true,\"configuration\":true}".utf8)))
     let report = DeviceInformation(name: "Pad", kind: .pad, wifi: true, renameRequest: UUID())
     try await remoteBLE.send(Record(.deviceInformation, metadata: Wire.encodeJSON(report)))
     for _ in 0..<100 { if await events.information[phone] != nil { break }; try await Task.sleep(for: .milliseconds(5)) }
@@ -223,6 +226,7 @@ private actor EventRecorder {
     try await remoteTCP.send(Record(.deviceInformation, metadata: Wire.encodeJSON(forbidden)))
     for _ in 0..<100 { if await !coordinator.usingTCP(phone) { break }; try await Task.sleep(for: .milliseconds(5)) }
     #expect(await !coordinator.usingTCP(phone))
+    #expect(await events.wifiPreferences[phone] == true)
     #expect(await events.information[phone]?.name == "Pad")
     await coordinator.stop(); await remoteBLE.close(); await remoteTCP.close()
 }
@@ -253,4 +257,82 @@ private final class PacketCounter: @unchecked Sendable {
     #expect(try await second.receive().kind == .wifiPreference)
     #expect(tx.counts == (1,0) && rx.counts == (0,1))
     await first.close(); await second.close()
+}
+
+@Test(arguments: [TransportKind.ble, .tcp])
+func boundedDuplexFilesCompleteWithOriginalBytes(_ transport: TransportKind) async throws {
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: base) }
+    let mac = UUID(), phone = UUID(), events = EventRecorder()
+    let leftStore = try TransferStore(root: base.appendingPathComponent("a"), downloads: base.appendingPathComponent("a-downloads"))
+    let rightStore = try TransferStore(root: base.appendingPathComponent("b"), downloads: base.appendingPathComponent("b-downloads"))
+    let left = SyncCoordinator(identity: mac, role: .mac, store: leftStore) { await events.record($0) }
+    let right = SyncCoordinator(identity: phone, role: .android, store: rightStore) { await events.record($0) }
+    let (a,b) = MemoryByteChannel.pair()
+    var channels = [a,b]
+    do {
+        let key = Data(repeating: 11, count: 32)
+        async let aa = Handshake.authenticate(channel: a, role: .mac, identity: mac, key: key, transport: .ble)
+        async let bb = Handshake.authenticate(channel: b, role: .android, identity: phone, key: key, transport: .ble)
+        let (authA,authB) = try await (aa,bb)
+        try await left.installBLE(phone, channel: EncryptedChannel(raw: a, authentication: authA, transport: .ble))
+        try await right.installBLE(mac, channel: EncryptedChannel(raw: b, authentication: authB, transport: .ble))
+        if transport == .tcp {
+            let offer = try await left.offerTCP(phone, addresses: [TCPAddress(host: "192.0.2.1", port: 12345)])
+            for _ in 0..<100 {
+                if (try? await right.bindingKey(peer: mac, context: offer.id)) != nil { break }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let binding = try await left.bindingKey(peer: phone, context: offer.id), (c,d) = MemoryByteChannel.pair()
+            channels += [c,d]
+            async let cc = Handshake.authenticate(channel: c, role: .mac, identity: mac, key: binding, context: offer.id, transport: .tcp)
+            async let dd = Handshake.authenticate(channel: d, role: .android, identity: phone, key: binding, context: offer.id, transport: .tcp)
+            let (authC,authD) = try await (cc,dd)
+            try await left.installTCP(phone, channel: EncryptedChannel(raw: c, authentication: authC, transport: .tcp), context: offer.id)
+            try await right.installTCP(mac, channel: EncryptedChannel(raw: d, authentication: authD, transport: .tcp), context: offer.id)
+        }
+        let bytes = Data(repeating: 73, count: 8 * 1024 * 1024)
+        let source = base.appendingPathComponent("source.bin"); try bytes.write(to: source)
+        let one = try await leftStore.snapshot(source, kind: .file, name: "one.bin", mime: "application/octet-stream", origin: mac)
+        let two = try await rightStore.snapshot(source, kind: .file, name: "two.bin", mime: "application/octet-stream", origin: phone)
+        async let first: Void = left.enqueue(one, targets: [phone], userInitiated: true)
+        async let second: Void = right.enqueue(two, targets: [mac], userInitiated: true)
+        _ = try await (first,second)
+        for _ in 0..<1000 { if await events.complete.count == 2 { break }; try await Task.sleep(for: .milliseconds(5)) }
+        #expect(await events.complete.count == 2)
+        #expect(await events.errors.isEmpty)
+        for id in [one.manifest.id, two.manifest.id] {
+            let url = try #require(await events.received[id])
+            #expect(try Data(contentsOf: url) == bytes)
+        }
+        #expect(await left.outgoingFiles().isEmpty)
+        #expect(await right.outgoingFiles().isEmpty)
+    } catch {
+        for channel in channels { await channel.close() }
+        await left.disconnect(phone); await right.disconnect(mac)
+        await leftStore.closeHandles(); await rightStore.closeHandles()
+        throw error
+    }
+    for channel in channels { await channel.close() }
+    await left.disconnect(phone); await right.disconnect(mac)
+    await leftStore.closeHandles(); await rightStore.closeHandles()
+}
+
+@Test func disconnectReleasesUnacknowledgedClipboardSnapshot() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = try TransferStore(root: root, downloads: root.appendingPathComponent("downloads"))
+    let mac = UUID(), peer = UUID(), key = Data(repeating: 3, count: 32)
+    let coordinator = SyncCoordinator(identity: mac, role: .mac, store: store) { _ in }
+    let (a,b) = MemoryByteChannel.pair()
+    async let aa = Handshake.authenticate(channel: a, role: .mac, identity: mac, key: key, transport: .ble)
+    async let bb = Handshake.authenticate(channel: b, role: .android, identity: peer, key: key, transport: .ble)
+    let (auth,_) = try await (aa,bb)
+    try await coordinator.installBLE(peer, channel: EncryptedChannel(raw: a, authentication: auth, transport: .ble))
+    let snapshot = try await store.snapshotText("original clipboard bytes", origin: mac)
+    try await coordinator.enqueue(snapshot, targets: [peer], userInitiated: false)
+    await coordinator.disconnect(peer)
+    for _ in 0..<100 { if !FileManager.default.fileExists(atPath: snapshot.url.path) { break }; await Task.yield() }
+    #expect(!FileManager.default.fileExists(atPath: snapshot.url.path))
+    await a.close(); await b.close(); await store.closeHandles()
 }

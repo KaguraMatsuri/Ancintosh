@@ -14,6 +14,7 @@ private struct IncomingJournal: Codable {
     var complete: Bool
     var delivered: Bool
     var output: String?
+    var completedAt: Date? = nil
 }
 
 private struct Incoming {
@@ -28,25 +29,40 @@ public actor TransferStore {
     private let downloads: URL
     private var incoming: [String: Incoming] = [:]
     private var readers: [URL: FileHandle] = [:]
+    private var ownedOutgoing: Set<String> = []
     private var epochs: [UUID: UUID] = [:]
     private var verifications: [String: VerificationLease] = [:]
+    private struct Completion { let peer: UUID; let date: Date }
+    private var completions: [String: Completion] = [:]
+    private var completionOrder: [UUID: [String]] = [:]
+    private var historyLoaded = false
+    private let now: @Sendable () -> Date
     private let checkpointBytes: UInt64 = 4 * 1_024 * 1_024
 
-    public init(root: URL, downloads: URL) throws {
+    public init(root: URL, downloads: URL, now: @escaping @Sendable () -> Date = { Date() }) throws {
         self.root = root
         self.downloads = downloads
+        self.now = now
         for directory in [root, root.appendingPathComponent("outgoing"), root.appendingPathComponent("incoming"), root.appendingPathComponent("clipboard")] {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
     }
 
     public nonisolated func snapshot(_ source: URL, kind: PayloadKind, name: String, mime: String, origin: UUID) async throws -> Snapshot {
-        let task = Task.detached(priority: .utility) { try self.copySnapshot(source, kind: kind, name: name, mime: mime, origin: origin) }
-        return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+        let id = UUID(), url = root.appendingPathComponent("outgoing/\(id.uuidString).blob")
+        await protectOutgoing(url)
+        let task = Task.detached(priority: .utility) { try self.copySnapshot(source, id: id, kind: kind, name: name, mime: mime, origin: origin) }
+        do {
+            return try await withTaskCancellationHandler {
+                let snapshot = try await task.value
+                try Task.checkCancellation()
+                return snapshot
+            } onCancel: { task.cancel() }
+        } catch { await release(url); throw error }
     }
+    private func protectOutgoing(_ url: URL) { ownedOutgoing.insert(fileKey(url)) }
 
-    private nonisolated func copySnapshot(_ source: URL, kind: PayloadKind, name: String, mime: String, origin: UUID) throws -> Snapshot {
-        let id = UUID()
+    private nonisolated func copySnapshot(_ source: URL, id: UUID, kind: PayloadKind, name: String, mime: String, origin: UUID) throws -> Snapshot {
         let destination = root.appendingPathComponent("outgoing/\(id.uuidString).blob")
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
@@ -82,6 +98,7 @@ public actor TransferStore {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         let manifest = try TransferManifest(id: id, kind: .text, name: id.uuidString, mime: "text/plain;charset=utf-8",
                                             size: UInt64(data.count), sha256: Crypto.digest(data), origin: origin)
+        ownedOutgoing.insert(fileKey(url))
         return Snapshot(manifest: manifest, url: url)
     }
 
@@ -94,6 +111,7 @@ public actor TransferStore {
     }
 
     public func release(_ snapshot: URL) {
+        ownedOutgoing.remove(fileKey(snapshot))
         try? readers.removeValue(forKey: snapshot)?.close()
         try? FileManager.default.removeItem(at: snapshot)
     }
@@ -109,8 +127,18 @@ public actor TransferStore {
 
     public func collectClipboard(keeping: Set<URL>) {
         let directory = root.appendingPathComponent("clipboard")
-        for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [] where !keeping.contains(url) {
+        let retained = Set(keeping.map(fileKey))
+        for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [] where !retained.contains(fileKey(url)) {
             try? readers.removeValue(forKey: url)?.close()
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    public func collectOutgoing(keeping: Set<URL>) {
+        let retained = Set(keeping.map(fileKey)).union(ownedOutgoing).union(readers.keys.map(fileKey))
+        let directory = root.appendingPathComponent("outgoing")
+        for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            where url.pathExtension == "blob" && !retained.contains(fileKey(url)) {
             try? FileManager.default.removeItem(at: url)
         }
     }
@@ -120,10 +148,11 @@ public actor TransferStore {
     }
 
     public func restoreOutgoing() throws -> [OutboundJob] {
+        loadHistory()
         let url = root.appendingPathComponent("outgoing.json")
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         return try Wire.decodeJSON([OutboundJob].self, Data(contentsOf: url)).compactMap { job in
-            guard job.manifest.kind == .file, job.snapshot.deletingLastPathComponent().standardizedFileURL == root.appendingPathComponent("outgoing").standardizedFileURL,
+            guard job.manifest.kind == .file, fileKey(job.snapshot.deletingLastPathComponent()) == fileKey(root.appendingPathComponent("outgoing")),
                   FileManager.default.fileExists(atPath: job.snapshot.path) else { return nil }
             var job = job
             job.begun = false; job.waitingForResume = false; job.finished = false
@@ -141,6 +170,7 @@ public actor TransferStore {
     public func begin(_ manifest: TransferManifest, peer: UUID, epoch: UUID? = nil) throws -> UInt64 {
         if let epoch, epochs[peer] != epoch { throw ProtocolFailure.invalidOffset }
         try manifest.validate()
+        loadHistory(); pruneHistory(peer)
         let key = identity(peer, manifest.id)
         verifications.removeValue(forKey: key)?.cancel()
         if var current = incoming[key] {
@@ -163,7 +193,7 @@ public actor TransferStore {
             guard journal.manifest == manifest && journal.peer == peer else { throw ProtocolFailure.invalidManifest }
         }
         if journal.complete {
-            incoming[key] = Incoming(journal: journal, handle: nil, written: manifest.size)
+            if !journal.delivered { incoming[key] = Incoming(journal: journal, handle: nil, written: manifest.size) }
             return manifest.size
         }
         let file = directory.appendingPathComponent("data.part")
@@ -179,6 +209,8 @@ public actor TransferStore {
         try save(journal, at: journalURL)
         return journal.durable
     }
+
+    public func incomingSize(peer: UUID, id: UUID) -> UInt64? { incoming[identity(peer, id)]?.journal.manifest.size }
 
     public func append(peer: UUID, id: UUID, offset: UInt64, bytes: Data, epoch: UUID? = nil) throws -> UInt64? {
         if let epoch, epochs[peer] != epoch { throw ProtocolFailure.invalidOffset }
@@ -200,8 +232,13 @@ public actor TransferStore {
     public func finish(peer: UUID, id: UUID, epoch: UUID? = nil) async throws -> (TransferManifest, URL, Bool) {
         if let epoch, epochs[peer] != epoch { throw ProtocolFailure.invalidOffset }
         let key = identity(peer, id)
+        if incoming[key] == nil, let data = try? Data(contentsOf: journalURL(key)),
+           let journal = try? Wire.decodeJSON(IncomingJournal.self, data), journal.complete, journal.delivered, let output = journal.output {
+            return (journal.manifest, URL(fileURLWithPath: output), false)
+        }
         guard var item = incoming[key] else { throw ProtocolFailure.invalidOffset }
         if item.journal.complete, let output = item.journal.output {
+            if item.journal.delivered { incoming.removeValue(forKey: key) }
             return (item.journal.manifest, URL(fileURLWithPath: output), !item.journal.delivered)
         }
         let manifest = item.journal.manifest
@@ -243,6 +280,8 @@ public actor TransferStore {
     public func cancel(peer: UUID, id: UUID) {
         let key = identity(peer, id)
         if let current = incoming[key], current.journal.complete { return }
+        if incoming[key] == nil, let data = try? Data(contentsOf: journalURL(key)),
+           let journal = try? Wire.decodeJSON(IncomingJournal.self, data), journal.complete { return }
         verifications.removeValue(forKey: key)?.cancel()
         try? incoming.removeValue(forKey: key)?.handle?.close()
         try? FileManager.default.removeItem(at: root.appendingPathComponent("incoming/\(key)"))
@@ -252,8 +291,11 @@ public actor TransferStore {
         let key = identity(peer, id)
         guard var item = incoming[key], item.journal.complete else { throw ProtocolFailure.invalidOffset }
         item.journal.delivered = true
+        item.journal.completedAt = now()
         try save(item.journal, at: journalURL(key))
-        incoming[key] = item
+        incoming.removeValue(forKey: key)
+        rememberCompletion(key, journal: item.journal)
+        pruneHistory(peer)
     }
 
     public func checkpoint(_ peer: UUID) throws {
@@ -265,6 +307,50 @@ public actor TransferStore {
             incoming[key] = item
         }
     }
+
+    // Only delivery receipts are bounded. Unfinished jobs and published files are never pruned.
+    private func loadHistory() {
+        guard !historyLoaded else { return }
+        historyLoaded = true
+        let folder = root.appendingPathComponent("incoming")
+        if let entries = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for case let url as URL in entries where url.lastPathComponent == "state.json" {
+                guard let data = try? Data(contentsOf: url), let journal = try? Wire.decodeJSON(IncomingJournal.self, data),
+                      journal.complete, journal.delivered else { continue }
+                let key = identity(journal.peer, journal.manifest.id)
+                guard fileKey(url) == fileKey(journalURL(key)) else { continue }
+                let date = journal.completedAt ?? (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now()
+                completions[key] = Completion(peer: journal.peer, date: date)
+            }
+        }
+        for (key, value) in completions.sorted(by: { $0.value.date == $1.value.date ? $0.key < $1.key : $0.value.date < $1.value.date }) {
+            completionOrder[value.peer, default: []].append(key)
+        }
+        for peer in Array(completionOrder.keys) { pruneHistory(peer) }
+    }
+    private func rememberCompletion(_ key: String, journal: IncomingJournal) {
+        loadHistory()
+        if completions[key] == nil { completionOrder[journal.peer, default: []].append(key) }
+        completions[key] = Completion(peer: journal.peer, date: journal.completedAt ?? now())
+    }
+    private func pruneHistory(_ peer: UUID) {
+        let cutoff = now().addingTimeInterval(-30 * 24 * 60 * 60)
+        var order = completionOrder[peer] ?? []
+        let expired = Set(order.filter { completions[$0].map { $0.date < cutoff } ?? true })
+        order.removeAll { expired.contains($0) }
+        let excess = max(0, order.count - 4096)
+        let removed = expired.union(order.prefix(excess))
+        if excess > 0 { order.removeFirst(excess) }
+        for key in removed {
+            completions.removeValue(forKey: key)
+            incoming.removeValue(forKey: key)
+            try? FileManager.default.removeItem(at: journalURL(key).deletingLastPathComponent())
+        }
+        if order.isEmpty { completionOrder.removeValue(forKey: peer) }
+        else { completionOrder[peer] = order }
+    }
+
+    private func fileKey(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
 
     private func identity(_ peer: UUID, _ id: UUID) -> String { "\(peer.uuidString)/\(id.uuidString)" }
     private func journalURL(_ key: String) -> URL { root.appendingPathComponent("incoming/\(key)/state.json") }

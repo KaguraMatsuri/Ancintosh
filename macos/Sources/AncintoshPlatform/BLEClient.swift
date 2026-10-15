@@ -26,6 +26,8 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     private var stopped = true
     private var scanPending = false
     private var scanTask: Task<Void, Never>?
+    private var recovery: [UUID: Task<Void, Never>] = [:]
+    private var backoffs: [UUID: RecoveryBackoff] = [:]
     private var lifecycle = BLEConnectionLifecycle()
     private var handshakes: [UUID: Task<Void, Never>] = [:]
     private var channels: [UUID: StreamByteChannel] = [:]
@@ -47,6 +49,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         central.scanForPeripherals(withServices: [BLEIdentifiers.service], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         scanTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            guard !Task.isCancelled else { return }
             self?.central.stopScan()
             self?.scanTask = nil
         }
@@ -57,24 +60,48 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         if keys[identifier] != key || lifecycle.phase(identifier) == .failed {
             invalidateHandshake(identifier)
             lifecycle.reset(identifier)
+            backoffs.removeValue(forKey: identifier)
         } else { lifecycle.register(identifier) }
         keys[identifier] = key
         if let expectedIdentity { identities[identifier] = expectedIdentity }
         guard central.state != .unknown, central.state != .resetting else { return }
         guard central.state == .poweredOn else { throw central.state == .unauthorized ? ProtocolFailure.permissionDenied : .peerUnavailable }
         guard let peripheral = peripherals[identifier] ?? central.retrievePeripherals(withIdentifiers: [identifier]).first else {
-            scan(); return
+            scan(); scheduleRecovery(identifier); return
         }
         peripherals[identifier] = peripheral
         requestConnection(peripheral)
     }
     private func requestConnection(_ peripheral: CBPeripheral) {
         guard !stopped, central.state == .poweredOn, keys[peripheral.identifier] != nil else { return }
+        recovery.removeValue(forKey: peripheral.identifier)?.cancel()
         peripheral.delegate = self
         if peripheral.state == .connected { openSession(peripheral) }
         else if lifecycle.beginConnection(peripheral.identifier) {
             central.connect(peripheral, options: [CBConnectPeripheralOptionEnableAutoReconnect: true])
         }
+    }
+    private func scheduleRecovery(_ device: UUID) {
+        guard !stopped, central.state == .poweredOn, keys[device] != nil,
+              lifecycle.phase(device) != .failed, recovery[device] == nil else { return }
+        let delay = backoffs[device, default: RecoveryBackoff()].next()
+        recovery[device] = Task { [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.recovery.removeValue(forKey: device)
+            guard !self.stopped, self.central.state == .poweredOn, self.lifecycle.phase(device) != .failed else { return }
+            if let peripheral = self.peripherals[device] ?? self.central.retrievePeripherals(withIdentifiers: [device]).first {
+                self.peripherals[device] = peripheral
+                self.requestConnection(peripheral)
+            } else {
+                if self.scanTask == nil { self.scan() }
+                self.scheduleRecovery(device)
+            }
+        }
+    }
+    private func cancelRecovery() {
+        for task in recovery.values { task.cancel() }
+        recovery.removeAll(); backoffs.removeAll()
     }
     private func openSession(_ peripheral: CBPeripheral) {
         let device = peripheral.identifier
@@ -92,9 +119,9 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     public func sessionDisconnected(_ peer: UUID, intentional: Bool) {
         guard !stopped, !intentional,
               let device = identities.first(where: { $0.value == peer })?.key,
-              lifecycle.sessionLost(device), let peripheral = peripherals[device] else { return }
+              lifecycle.sessionLost(device), peripherals[device] != nil else { return }
         invalidateHandshake(device)
-        requestConnection(peripheral)
+        scheduleRecovery(device)
     }
     public func sessionAuthenticated(_ peer: UUID) -> Bool {
         !stopped && identities.contains { device, identity in identity == peer && lifecycle.phase(device) == .ready }
@@ -107,6 +134,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     }
     public func stop() async {
         stopped = true
+        cancelRecovery()
         scanPending = false
         scanTask?.cancel(); scanTask = nil
         central.stopScan()
@@ -121,13 +149,15 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
     }
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         if central.state == .poweredOn && !stopped {
+            cancelRecovery()
             if scanPending { scan() }
             for id in keys.keys where lifecycle.phase(id) != .failed {
-                guard let peripheral = peripherals[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first else { scan(); continue }
+                guard let peripheral = peripherals[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first else { scan(); scheduleRecovery(id); continue }
                 peripherals[id] = peripheral
                 requestConnection(peripheral)
             }
         } else if central.state != .poweredOn {
+            cancelRecovery()
             lifecycle.radioUnavailable()
             for device in keys.keys {
                 let pending = invalidateHandshake(device)
@@ -153,7 +183,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         guard !stopped else { return }
         lifecycle.disconnected(peripheral.identifier, reconnecting: false)
         failed?(peripheral.identifier, .peerUnavailable)
-        if central.state == .poweredOn { scan() }
+        scheduleRecovery(peripheral.identifier)
     }
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: (any Error)?) {
         disconnected(peripheral, reconnecting: false)
@@ -167,7 +197,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         lifecycle.disconnected(device, reconnecting: reconnecting && !stopped)
         let pending = invalidateHandshake(device)
         if let peer = identities[device] { disconnectSession(device, peer: peer, intentional: stopped, pending: pending) }
-        if !reconnecting, !stopped { requestConnection(peripheral) }
+        if !reconnecting, !stopped { scheduleRecovery(device) }
     }
     private func disconnectSession(_ device: UUID, peer: UUID, intentional: Bool, pending: Task<Void, Never>? = nil) {
         let previous = cleanup[device]
@@ -182,7 +212,7 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
         guard !stopped else { return }
         // Transport loss can recover; a failed proof or unsupported peer needs user action.
         if failure == .peerUnavailable || failure == .timeout { lifecycle.disconnected(device, reconnecting: false) }
-        else { lifecycle.fail(device) }
+        else { lifecycle.fail(device); recovery.removeValue(forKey: device)?.cancel(); backoffs.removeValue(forKey: device) }
         invalidateHandshake(device)
         failed?(device, failure)
         central.cancelPeripheralConnection(peripheral)
@@ -239,6 +269,8 @@ public final class BLEClient: NSObject, @preconcurrency CBCentralManagerDelegate
                 timeout.cancel()
                 try Task.checkCancellation()
                 guard let self, !self.stopped, self.lifecycle.authenticated(device, token: token) else { await raw.close(); return }
+                self.recovery.removeValue(forKey: device)?.cancel()
+                self.backoffs.removeValue(forKey: device)
                 self.identities[device] = auth.peer
                 self.associated?(device, auth.peer)
                 try await coordinator.installBLE(auth.peer, channel: EncryptedChannel(raw: raw, authentication: auth, transport: .ble, traffic: { packet($0, false) }))

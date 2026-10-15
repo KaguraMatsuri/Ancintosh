@@ -75,3 +75,61 @@ import AncintoshCore
     for root in created { #expect(!manager.fileExists(atPath: root.path)) }
 }
 #endif
+
+#if DEBUG
+@MainActor @Test func deviceSaveValidatesNameBeforeChangingConfigurationOrConnection() async throws {
+    let (runtime, peer) = try fixture()
+    let before = runtime.configuration
+    let invalid = PeerProfile(id: peer, identity: peer, name: String(repeating: "x", count: 9000))
+    await #expect(throws: ProtocolFailure.oversizedRecord) {
+        try await runtime.save(invalid, key: String(repeating: "1", count: 64))
+    }
+    #expect(runtime.configuration.peers[0].name == before.peers[0].name)
+    #expect(runtime.configuration.revision == before.revision && !runtime.running)
+    runtime.start(); try await runtime.verify(peer)
+    let connectedRevision = runtime.configuration.revision
+    await #expect(throws: ProtocolFailure.oversizedRecord) {
+        try await runtime.save(invalid, key: String(repeating: "1", count: 64))
+    }
+    #expect(runtime.connected.contains(peer) && runtime.configuration.revision == connectedRevision)
+    try await runtime.test(.clipboard, peer: peer)
+    #expect(runtime.demonstrationResult?.passed == true)
+    await runtime.dispose()
+}
+
+@MainActor @Test func disposingWaitsForFilePreparationAndPreventsLateStateWrites() async throws {
+    let (runtime, peer) = try fixture()
+    let source = FileManager.default.temporaryDirectory.appendingPathComponent("prepare-\(UUID()).bin")
+    defer { try? FileManager.default.removeItem(at: source) }
+    FileManager.default.createFile(atPath: source.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: source); try handle.truncate(atOffset: 64 * 1024 * 1024); try handle.close()
+    runtime.start(); try await runtime.verify(peer)
+    let sending = Task { try await runtime.files([source], peer: peer) }
+    while !runtime.preparing { await Task.yield() }
+    await runtime.dispose()
+    #expect(!runtime.preparing && !runtime.running)
+    _ = await sending.result
+    #expect(runtime.transfers.isEmpty)
+}
+
+@MainActor @Test func failureRecoveryClearsOnlyItsDeviceAndOperation() async throws {
+    let (runtime, peer) = try fixture()
+    let other = UUID()
+    runtime.recordFailure(peer, .originalUnavailable, source: .clipboard(true))
+    runtime.recordFailure(peer, .permissionDenied, source: .notification)
+    runtime.recordFailure(other, .peerUnavailable, source: .connection)
+    runtime.clearFailure(peer, source: .clipboard(true))
+    #expect(runtime.failures[peer] == .permissionDenied)
+    #expect(runtime.failures[other] == .peerUnavailable)
+    runtime.clearFailure(peer, source: .notification)
+    #expect(runtime.failures[peer] == nil && runtime.failures[other] == .peerUnavailable)
+    runtime.start(); try await runtime.verify(peer)
+    runtime.recordFailure(peer, .originalUnavailable, source: .clipboard(true))
+    runtime.demonstrationText = "recovered"
+    try await runtime.test(.clipboard, peer: peer)
+    try await wait { runtime.failures[peer] == nil }
+    #expect(runtime.failures[peer] == nil && runtime.failures[other] == .peerUnavailable)
+    await runtime.dispose()
+}
+
+#endif

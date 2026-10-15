@@ -45,11 +45,12 @@ object Handshake {
 class EncryptedChannel(private val raw: ByteChannel, authentication: Authentication, val transport: Transport) {
     val root = authentication.crypto.root
     private val crypto = authentication.crypto
-    private data class Write(val record: Record, val completion: CompletableDeferred<Unit>?, val buffered: Boolean)
+    private data class Write(val record: Record, val completion: CompletableDeferred<Unit>?, val buffered: Boolean, val response: Boolean = false)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val writes = Channel<Write>(Channel.UNLIMITED)
     private val lifetime = ChannelLifetime()
     private val slots = TransferSlots(16)
+    private val responses = TransferSlots(16)
     private val reader = Mutex()
     @Volatile private var dataEpoch: UUID? = null
     private val discarded = java.util.concurrent.ConcurrentHashMap.newKeySet<UUID>()
@@ -62,7 +63,7 @@ class EncryptedChannel(private val raw: ByteChannel, authentication: Authenticat
                         if (!write.buffered || (write.record.epoch == dataEpoch && !discarded.contains(write.record.id))) raw.write(crypto.seal(write.record))
                         write.completion?.complete(Unit)
                     } catch (error: Exception) { write.completion?.completeExceptionally(error); throw error }
-                    finally { if (write.buffered) releaseSlot() }
+                    finally { if (write.buffered) releaseSlot(); if (write.response) responses.release() }
                 }
             } catch (_: Exception) { close() }
         }
@@ -71,6 +72,15 @@ class EncryptedChannel(private val raw: ByteChannel, authentication: Authenticat
         if (lifetime.closed) fail(Failure.peerUnavailable)
         val done = CompletableDeferred<Unit>()
         writes.send(Write(record, done, false)); done.await()
+    }
+    suspend fun reply(record: Record) {
+        if (record.kind == RecordKind.DATA || record.bytes.isNotEmpty()) fail(Failure.invalidFrame)
+        responses.acquire(lifetime)
+        try {
+            currentCoroutineContext().ensureActive()
+            if (lifetime.closed) fail(Failure.peerUnavailable)
+            writes.send(Write(record, null, false, true))
+        } catch (error: Exception) { responses.release(); throw error }
     }
     suspend fun sendBuffered(produce: suspend () -> Record) {
         slots.acquire(lifetime)
@@ -97,12 +107,13 @@ class EncryptedChannel(private val raw: ByteChannel, authentication: Authenticat
     @Synchronized fun close() {
         if (lifetime.closed) return
         lifetime.closed = true
-        slots.removeClosedWaiters(); TransferSlots.shared.removeClosedWaiters()
+        slots.removeClosedWaiters(); responses.removeClosedWaiters(); TransferSlots.shared.removeClosedWaiters()
         writes.close(); raw.close(); scope.cancel()
         while (true) {
             val write = writes.tryReceive().getOrNull() ?: break
             write.completion?.completeExceptionally(ProtocolException(Failure.peerUnavailable))
             if (write.buffered) releaseSlot()
+            if (write.response) responses.release()
         }
         discarded.clear()
     }

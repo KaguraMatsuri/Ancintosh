@@ -24,24 +24,31 @@ typealias PublicationCommit = (() -> String) -> String
 typealias StagedPublisher = (File, Manifest, () -> Unit, PublicationCommit) -> String
 
 private data class Incoming(val manifest: Manifest, val peer: UUID, val directory: File, var handle: RandomAccessFile?,
-                            var written: Long, var durable: Long, var complete: Boolean, var delivered: Boolean, var output: String?, var generation: UUID = UUID.randomUUID())
+                            var written: Long, var durable: Long, var complete: Boolean, var delivered: Boolean, var output: String?, var completedAt: Long? = null, var generation: UUID = UUID.randomUUID())
 
-class TransferStore(val root: File, private val stagedPublish: StagedPublisher? = null, private val publish: (File, Manifest) -> String) {
+class TransferStore(val root: File, private val stagedPublish: StagedPublisher? = null, private val now: () -> Long = System::currentTimeMillis, private val publish: (File, Manifest) -> String) {
     private val incoming = mutableMapOf<String, Incoming>()
     private val readers = mutableMapOf<File, RandomAccessFile>()
+    private val ownedOutgoing = mutableSetOf<File>()
     private val epochs = mutableMapOf<UUID, UUID>()
     private val verifications = mutableMapOf<String, AtomicBoolean>()
     private val verification = Mutex()
+    private data class Completion(val peer: UUID, val date: Long)
+    private val completions = mutableMapOf<String, Completion>()
+    private val completionOrder = mutableMapOf<UUID, MutableList<String>>()
+    private var historyLoaded = false
     init { listOf(root, File(root, "outgoing"), File(root, "incoming"), File(root, "clipboard")).forEach { it.mkdirs() } }
 
-    fun snapshot(input: InputStream, kind: PayloadKind, name: String, mime: String, origin: UUID): Snapshot {
+    fun snapshot(input: InputStream, kind: PayloadKind, name: String, mime: String, origin: UUID, check: () -> Unit = {}): Snapshot {
         val id = UUID.randomUUID(); val file = File(root, "outgoing/$id.blob")
         var success = false
+        synchronized(this) { ownedOutgoing.add(file) }
         try {
             val digest = MessageDigest.getInstance("SHA-256"); var size = 0L
             input.use { source -> RandomAccessFile(file, "rw").use { target ->
                 val buffer = ByteArray(65536)
                 while (true) {
+                    check()
                     val count = source.read(buffer); if (count < 0) break; if (count == 0) continue
                     target.write(buffer, 0, count); digest.update(buffer, 0, count); size += count
                 }
@@ -50,14 +57,14 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
             val manifest = Manifest(id, kind, name, mime, size, digest.digest().hex(), origin)
             success = true
             return Snapshot(manifest, file)
-        } finally { if (!success) file.delete() }
+        } finally { if (!success) release(file) }
     }
     @Synchronized fun read(snapshot: Snapshot, offset: Long, count: Int): ByteArray {
         val handle = readers.getOrPut(snapshot.file) { RandomAccessFile(snapshot.file, "r") }
         handle.seek(offset); val bytes = ByteArray(count); val read = handle.read(bytes)
         return if (read < 0) byteArrayOf() else bytes.copyOf(read)
     }
-    @Synchronized fun release(file: File) { readers.remove(file)?.close(); if (file.parentFile == File(root, "outgoing")) file.delete() }
+    @Synchronized fun release(file: File) { ownedOutgoing.remove(file); readers.remove(file)?.close(); if (file.parentFile == File(root, "outgoing")) file.delete() }
     @Synchronized fun closeHandles() {
         readers.values.forEach { runCatching { it.close() } }; readers.clear()
         verifications.values.forEach { it.set(true) }
@@ -68,6 +75,10 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
             if (keeping.none { it.parentFile == directory }) directory.deleteRecursively()
         }
     }
+    @Synchronized fun collectOutgoing(keeping: Set<File>) {
+        val retained = keeping + ownedOutgoing + readers.keys
+        File(root, "outgoing").listFiles()?.filter { it.extension == "blob" && it !in retained }?.forEach { it.delete() }
+    }
     @Synchronized fun persist(jobs: List<OutboundJob>) {
         val array = JSONArray()
         jobs.filter { it.snapshot.manifest.kind == PayloadKind.FILE }.forEach {
@@ -77,6 +88,7 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
         atomic(File(root, "outgoing.json"), array.toString().toByteArray())
     }
     @Synchronized fun restore(): List<OutboundJob> {
+        loadHistory()
         val state = File(root, "outgoing.json"); if (!state.exists()) return emptyList()
         val array = JSONArray(state.readText())
         return (0 until array.length()).mapNotNull {
@@ -93,6 +105,7 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
     }
     @Synchronized fun begin(manifest: Manifest, peer: UUID, epoch: UUID? = null): Long {
         if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
+        loadHistory(); pruneHistory(peer)
         val key = "$peer/${manifest.id}"
         verifications.remove(key)?.set(true)
         incoming[key]?.let {
@@ -114,9 +127,12 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
         if (handle != null) { if (handle.length() < durable) { handle.close(); fail(Failure.invalidOffset) }; handle.setLength(durable); handle.seek(durable) }
         val item = Incoming(manifest, peer, directory, handle, durable, durable, complete,
             stored?.optBoolean("delivered") ?: false, stored?.optString("output")?.takeIf { it.isNotEmpty() })
-        incoming[key] = item; save(item)
+        item.completedAt = stored?.takeUnless { it.isNull("completedAt") }?.getLong("completedAt")
+        if (!complete || !item.delivered) incoming[key] = item
+        save(item)
         return if (complete) manifest.size else durable
     }
+    @Synchronized fun incomingSize(peer: UUID, id: UUID): Long? = incoming["$peer/$id"]?.manifest?.size
     @Synchronized fun append(peer: UUID, id: UUID, offset: Long, bytes: ByteArray, epoch: UUID? = null): Long? {
         if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
         val item = incoming["$peer/$id"] ?: fail(Failure.invalidOffset)
@@ -132,8 +148,17 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
             val cancelled = AtomicBoolean(false)
             val item = synchronized(this@TransferStore) {
                 if (epoch != null && epochs[peer] != epoch) fail(Failure.invalidOffset)
-                val found = incoming[key] ?: fail(Failure.invalidOffset)
-                if (found.complete) return@withContext Received(found.manifest, File(found.output!!), found.output!!, !found.delivered)
+                val found = incoming[key] ?: run {
+                    val file = File(root, "incoming/$key/state.json")
+                    val j = if (file.isFile) JSONObject(file.readText()) else fail(Failure.invalidOffset)
+                    if (!j.getBoolean("complete") || !j.getBoolean("delivered")) fail(Failure.invalidOffset)
+                    val manifest = Manifest.decode(j.getJSONObject("manifest")); val output = j.getString("output")
+                    return@withContext Received(manifest, File(output), output, false)
+                }
+                if (found.complete) {
+                    if (found.delivered) incoming.remove(key)
+                    return@withContext Received(found.manifest, File(found.output!!), found.output!!, !found.delivered)
+                }
                 if (found.written != found.manifest.size) fail(Failure.invalidOffset)
                 found.handle?.fd?.sync(); found.handle?.close(); found.handle = null
                 verifications[key] = cancelled
@@ -179,7 +204,15 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
             }
         }
     }
-    @Synchronized fun delivered(peer: UUID, id: UUID) { incoming["$peer/$id"]?.let { it.delivered = true; save(it) } }
+    @Synchronized fun delivered(peer: UUID, id: UUID) {
+        val key = "$peer/$id"
+        val item = incoming[key] ?: fail(Failure.invalidOffset)
+        item.delivered = true; item.completedAt = now(); save(item); incoming.remove(key)
+        loadHistory()
+        if (!completions.containsKey(key)) completionOrder.getOrPut(peer) { mutableListOf() }.add(key)
+        completions[key] = Completion(peer, item.completedAt!!)
+        pruneHistory(peer)
+    }
     @Synchronized fun checkpoint(peer: UUID) {
         incoming.values.filter { it.peer == peer && !it.complete }.forEach {
             it.handle?.fd?.sync(); it.durable = it.written; save(it)
@@ -188,13 +221,50 @@ class TransferStore(val root: File, private val stagedPublish: StagedPublisher? 
     @Synchronized fun cancel(peer: UUID, id: UUID) {
         val item = incoming["$peer/$id"]
         if (item?.complete == true) return
+        if (item == null) {
+            val state = File(root, "incoming/$peer/$id/state.json")
+            if (state.isFile && JSONObject(state.readText()).optBoolean("complete")) return
+        }
         verifications.remove("$peer/$id")?.set(true)
         incoming.remove("$peer/$id")?.handle?.close(); File(root, "incoming/$peer/$id").deleteRecursively()
+    }
+    private fun loadHistory() {
+        if (historyLoaded) return
+        historyLoaded = true
+        File(root, "incoming").walkTopDown().filter { it.isFile && it.name == "state.json" }.forEach { file ->
+            runCatching {
+                val j = JSONObject(file.readText())
+                if (j.optBoolean("complete") && j.optBoolean("delivered")) {
+                    val peer = UUID.fromString(j.getString("peer")); val id = Manifest.decode(j.getJSONObject("manifest")).id
+                    val key = "$peer/$id"
+                    if (file.canonicalFile == File(root, "incoming/$key/state.json").canonicalFile) {
+                        completions[key] = Completion(peer, j.optLong("completedAt", file.lastModified()))
+                    }
+                }
+            }
+        }
+        completions.entries.sortedWith(compareBy({ it.value.date }, { it.key })).forEach { (key, value) ->
+            completionOrder.getOrPut(value.peer) { mutableListOf() }.add(key)
+        }
+        completionOrder.keys.toList().forEach(::pruneHistory)
+    }
+    private fun pruneHistory(peer: UUID) {
+        val cutoff = now() - 30L * 24 * 60 * 60 * 1000
+        val order = completionOrder[peer] ?: return
+        val expired = order.filter { (completions[it]?.date ?: Long.MIN_VALUE) < cutoff }.toSet()
+        order.removeAll(expired)
+        val excess = (order.size - 4096).coerceAtLeast(0)
+        val removed = expired + order.take(excess)
+        repeat(excess) { order.removeAt(0) }
+        removed.forEach { key ->
+            completions.remove(key); incoming.remove(key); File(root, "incoming/$key").deleteRecursively()
+        }
+        if (order.isEmpty()) completionOrder.remove(peer)
     }
     private fun save(item: Incoming) {
         atomic(File(item.directory, "state.json"), JSONObject().put("manifest", item.manifest.json())
             .put("peer", item.peer.toString()).put("durable", item.durable).put("complete", item.complete)
-            .put("delivered", item.delivered).put("output", item.output).bytes())
+            .put("delivered", item.delivered).put("output", item.output).put("completedAt", item.completedAt).bytes())
     }
     private fun atomic(file: File, bytes: ByteArray) {
         val temp = File(file.parentFile, "${file.name}.tmp")

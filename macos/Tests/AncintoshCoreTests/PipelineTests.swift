@@ -55,3 +55,16 @@ private func syntheticAuthentication() throws -> Authentication {
     owner.close(); await pool.removeClosedWaiters()
     await pool.release()
 }
+
+@MainActor @Test func boundedRepliesReturnWithoutWaitingForTheWriterAndCloseWakesWaiters() async throws {
+    let raw = StalledWriter()
+    let channel = try EncryptedChannel(raw: raw, authentication: syntheticAuthentication(), transport: .tcp)
+    var accepted = 0
+    let producer = Task {
+        for _ in 0..<17 { try await channel.reply(Record(.acknowledge)); accepted += 1 }
+    }
+    for _ in 0..<100 { if accepted == 16 { break }; try await Task.sleep(for: .milliseconds(5)) }
+    #expect(accepted == 16)
+    await channel.close()
+    if case .success = await producer.result { Issue.record("Closed reply producer unexpectedly completed") }
+}

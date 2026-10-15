@@ -230,7 +230,7 @@ private struct FileTransferSettings: View {
             Section("文件传输") {
                 ForEach(runtime.transfers.values.sorted { $0.id.uuidString < $1.id.uuidString }) { transfer in
                     VStack(alignment: .leading) {
-                        Text(transfer.name)
+                        Label(transfer.name, systemImage: transfer.sending ? "arrow.up" : "arrow.down")
                         ProgressView(value: Double(transfer.bytes), total: Double(max(1, transfer.size)))
                             .accessibilityLabel("传输进度")
                         Text("\(ByteCountFormatter.string(fromByteCount: Int64(transfer.bytes), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(transfer.size), countStyle: .file))")
@@ -238,7 +238,7 @@ private struct FileTransferSettings: View {
                         if let failure = transfer.failure { Text(Copy.failure(failure)) }
                         else if !runtime.connected.contains(transfer.peer) { Text("已暂停，重新连接后继续。") }
                         HStack {
-                            if transfer.failure != nil { Button("重试") { perform(operations, scopes: scopes(transfer.peer), error: $error) { try await runtime.retry(transfer.id, peer: transfer.peer) } }.disabled(operations.busy(scopes(transfer.peer))) }
+                            if transfer.sending && transfer.failure != nil { Button("重试") { perform(operations, scopes: scopes(transfer.peer), error: $error) { try await runtime.retry(transfer.id, peer: transfer.peer) } }.disabled(operations.busy(scopes(transfer.peer))) }
                             Button("取消") { perform(operations, scopes: scopes(transfer.peer), error: $error) { await runtime.cancel(transfer.id, peer: transfer.peer) } }.disabled(operations.busy(scopes(transfer.peer)))
                         }
                     }
@@ -345,8 +345,17 @@ private struct RuntimeFailure: View {
     var runtime: MacRuntime
 
     var body: some View {
-        if let failure = runtime.failures.values.first {
-            Section("提示") { Text(Copy.failure(failure)) }
+        if !runtime.failures.isEmpty {
+            Section("提示") {
+                ForEach(runtime.failures.keys.sorted(by: { $0.uuidString < $1.uuidString }), id: \.self) { peer in
+                    VStack(alignment: .leading) {
+                        if let profile = runtime.configuration.peers.first(where: { $0.id == peer || $0.identity == peer }) {
+                            Text(profile.name ?? profile.id.uuidString)
+                        } else { Text(peer == runtime.configuration.identity ? runtime.configuration.name : peer.uuidString) }
+                        if let failure = runtime.failures[peer] { Text(Copy.failure(failure)) }
+                    }
+                }
+            }
         }
     }
 }
@@ -357,13 +366,15 @@ private struct TopologyPane: View {
     @Binding var editing: PeerProfile?
     @Binding var error: String?
     let editMac: () -> Void
+    @State private var expandedCanvas = CGSize.zero
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
+            let minimum = TopologyLayout.minimumSize(count: runtime.configuration.peers.count)
+            ScrollView([.horizontal, .vertical]) {
                 topology
-                    .frame(height: max(geometry.size.height - 32,
-                        max(644, CGFloat((runtime.configuration.peers.count + 3) / 4) * 160 + 240)))
+                    .frame(width: max(geometry.size.width - 32, minimum.width, expandedCanvas.width),
+                           height: max(geometry.size.height - 32, minimum.height, expandedCanvas.height))
                     .padding(16)
             }
         }
@@ -384,7 +395,7 @@ private struct TopologyPane: View {
                       let profile = runtime.configuration.peers.first(where: { $0.id == id }) else { return }
                 do { try runtime.connect(profile) } catch { self.error = Copy.failure(error) }
             }, edit: { id in editing = runtime.configuration.peers.first(where: { $0.id == id }) },
-            move: movePeer, place: runtime.placeNodes)
+            move: movePeer, place: runtime.placeNodes, resize: { expandedCanvas = $0 })
     }
 
     private func movePeer(_ id: UUID, down: Bool) {

@@ -201,10 +201,22 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
             setCallback = callback
             advertiser.startAdvertisingSet(parameters(interval),
                 AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).build(),
-                AdvertiseData.Builder().setIncludeDeviceName(true).build(), null, null, callback)
+                scanResponse(), null, null, callback)
         } catch (_: SecurityException) { stopAdvertising(); failed(Failure.permissionDenied) }
         catch (_: IllegalArgumentException) { fallbackAdvertising(cycle) }
         catch (_: IllegalStateException) { fallbackAdvertising(cycle) }
+    }
+    private fun scanResponse(): AdvertiseData {
+        val length = try { adapter.name?.toByteArray(Charsets.UTF_8)?.size ?: 0 }
+            catch (_: SecurityException) { 0 }
+        return AdvertiseData.Builder().setIncludeDeviceName(length in 1..29).build()
+    }
+    /** Stop discovery first, keeping the established socket alive for GOODBYE. */
+    @Synchronized fun prepareStop() {
+        running = false
+        power.stop()
+        stopAdvertising()
+        runCatching { server?.close() }; server = null
     }
     @Synchronized
     private fun fallbackAdvertising(cycle: Long) {
@@ -229,7 +241,7 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
             advertiser.startAdvertising(
                 AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER).setConnectable(true).build(),
                 AdvertiseData.Builder().addServiceUuid(ParcelUuid(SERVICE)).build(),
-                AdvertiseData.Builder().setIncludeDeviceName(true).build(), callback)
+                scanResponse(), callback)
         } catch (_: SecurityException) { advertising = null; failed(Failure.permissionDenied) }
     }
     @Synchronized
@@ -249,7 +261,7 @@ class BLEPeripheral(private val context: Context, private val scope: CoroutineSc
     @Synchronized
     fun sessionDisconnected() {
         // A previous session's event must not close a newer connection or handshake.
-        if (session.connected != null || (active != null && activeDevice == null)) return
+        if (!running || session.connected != null || (active != null && activeDevice == null)) return
         active?.close(); active = null; activeDevice = null
         power.disconnected(SystemClock.elapsedRealtime())
         if (running) advertise()

@@ -20,6 +20,13 @@ data class NotificationMessage(val id: UUID, val action: Action, val application
         return this
     }
     companion object {
+        fun sourceID(device: UUID, source: String): UUID {
+            val bytes = Crypto.digest((device.toString() + "/" + source).toByteArray(Charsets.UTF_8)).unhex().copyOf(16)
+            bytes[6] = ((bytes[6].toInt() and 15) or 128).toByte()
+            bytes[8] = ((bytes[8].toInt() and 63) or 128).toByte()
+            val buffer = java.nio.ByteBuffer.wrap(bytes)
+            return UUID(buffer.long, buffer.long)
+        }
         fun decode(j: JSONObject): NotificationMessage = NotificationMessage(UUID.fromString(j.getString("id")), Action.valueOf(j.getString("action")),
             j.getString("application"), j.getString("title"), j.getString("body")).validated()
         fun bounded(id: UUID, application: String, title: String, body: String): NotificationMessage {

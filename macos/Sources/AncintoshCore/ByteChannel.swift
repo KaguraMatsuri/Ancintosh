@@ -61,10 +61,12 @@ public actor EncryptedChannel {
         let record: Record
         let continuation: CheckedContinuation<Void, any Error>?
         let buffered: Bool
+        let response: Bool
     }
     private var writes: [Write] = []
     private let lifetime = ChannelLifetime()
     private let slots = TransferSlots(count: 16)
+    private let responses = TransferSlots(count: 16)
     private var writing = false
     private var closed = false
     private var dataEpoch: UUID?
@@ -80,9 +82,21 @@ public actor EncryptedChannel {
     public func send(_ record: Record) async throws {
         guard !closed else { throw ProtocolFailure.peerUnavailable }
         try await withCheckedThrowingContinuation { continuation in
-            writes.append(Write(record: record, continuation: continuation, buffered: false))
+            writes.append(Write(record: record, continuation: continuation, buffered: false, response: false))
             if !writing { writing = true; Task { await self.drain() } }
         }
+    }
+
+    /// A bounded reply must not stop the only reader while the writer is backpressured.
+    public func reply(_ record: Record) async throws {
+        guard record.kind != .data, record.bytes.isEmpty else { throw ProtocolFailure.invalidFrame }
+        try await responses.acquire(lifetime)
+        do {
+            try Task.checkCancellation()
+            guard !closed else { throw ProtocolFailure.peerUnavailable }
+            writes.append(Write(record: record, continuation: nil, buffered: false, response: true))
+            if !writing { writing = true; Task { await self.drain() } }
+        } catch { await responses.release(); throw error }
     }
 
     public func sendBuffered(_ produce: @Sendable () async throws -> Record) async throws -> Int {
@@ -96,7 +110,7 @@ public actor EncryptedChannel {
             guard !closed, dataEpoch == record.epoch else { throw ProtocolFailure.peerUnavailable }
             guard !discarded.contains(record.transferID) else { throw ProtocolFailure.cancelled }
             guard record.kind == .data, record.bytes.count <= (transport == .tcp ? Wire.tcpChunkSize : Wire.bleChunkSize) else { throw ProtocolFailure.oversizedRecord }
-            writes.append(Write(record: record, continuation: nil, buffered: true))
+            writes.append(Write(record: record, continuation: nil, buffered: true, response: false))
             if !writing { writing = true; Task { await self.drain() } }
             return record.bytes.count
         } catch { await releaseSlot(); throw error }
@@ -126,6 +140,7 @@ public actor EncryptedChannel {
             }
             catch { write.continuation?.resume(throwing: error); await close() }
             if write.buffered { await releaseSlot() }
+            if write.response { await responses.release() }
         }
         writing = false
     }
@@ -153,12 +168,13 @@ public actor EncryptedChannel {
         guard !closed else { return }
         closed = true
         lifetime.close()
-        await slots.removeClosedWaiters(); await TransferSlots.shared.removeClosedWaiters()
+        await slots.removeClosedWaiters(); await responses.removeClosedWaiters(); await TransferSlots.shared.removeClosedWaiters()
         let pending = writes
         writes.removeAll()
         for write in pending {
             write.continuation?.resume(throwing: ProtocolFailure.peerUnavailable)
             if write.buffered { await releaseSlot() }
+            if write.response { await responses.release() }
         }
         await raw.close()
     }

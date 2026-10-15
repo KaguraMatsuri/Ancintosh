@@ -19,6 +19,7 @@ import java.util.UUID
 import org.json.JSONObject
 
 class FileAccess(private val context: Context, private val store: TransferStore, private val identity: UUID) {
+    fun release(snapshot: Snapshot) = store.release(snapshot.file)
     fun shareSnapshot(intent: Intent): Snapshot {
         if (intent.action != Intent.ACTION_SEND) fail(Failure.unsupported)
         if (intent.type == "text/plain") {
@@ -32,7 +33,7 @@ class FileAccess(private val context: Context, private val store: TransferStore,
         }
         fail(Failure.unsupported)
     }
-    fun snapshot(uri: Uri, kind: PayloadKind): Snapshot {
+    fun snapshot(uri: Uri, kind: PayloadKind, check: () -> Unit = {}): Snapshot {
         if (uri.scheme != "content") fail(Failure.originalUnavailable)
         val resolver = context.contentResolver
         val mime = resolver.getType(uri) ?: "application/octet-stream"
@@ -55,7 +56,7 @@ class FileAccess(private val context: Context, private val store: TransferStore,
             original = MediaStore.setRequireOriginal(uri)
         }
         val input = resolver.openInputStream(original) ?: fail(Failure.originalUnavailable)
-        return store.snapshot(input, kind, name ?: fail(Failure.invalidName), mime, identity)
+        return store.snapshot(input, kind, name ?: fail(Failure.invalidName), mime, identity, check)
     }
     fun clipboardSnapshot(): Snapshot {
         val clipboard = context.getSystemService(ClipboardManager::class.java)

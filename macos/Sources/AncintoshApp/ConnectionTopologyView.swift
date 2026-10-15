@@ -23,6 +23,7 @@ struct ConnectionTopologyView: View {
     let edit: (UUID) -> Void
     let move: (UUID, Bool) -> Void
     let place: ([UUID: NodePosition]) -> Void
+    let resize: (CGSize) -> Void
     private let macHeight: CGFloat = 128
     private let nodeHeight: CGFloat = 208
     private struct DragSession {
@@ -65,6 +66,10 @@ struct ConnectionTopologyView: View {
             .onChange(of: gestureActive) { _, active in if !active { drag = nil } }
             .onAppear { saveInitialPositions(size) }
             .onChange(of: devices.map(\.id)) { _, _ in saveInitialPositions(size) }
+            .task(id: [size.width, size.height]) {
+                do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
+                if !Task.isCancelled, drag == nil { saveInitialPositions(size) }
+            }
             .onChange(of: devices.map(\.position)) { _, _ in
                 for device in devices where pendingPositions[device.id] == device.position {
                     pendingPositions.removeValue(forKey: device.id)
@@ -109,7 +114,7 @@ struct ConnectionTopologyView: View {
                 // Keep the displayed endpoint until the parent supplies its persisted value.
                 pendingPositions[device.id] = saved
                 drag = nil
-                place([device.id: saved])
+                settle(size, preferred: device.id)
             })
         .background(.background, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(device.connected ? Color.secondary.opacity(0.4) : .red, lineWidth: device.connected ? 1 : 2))
@@ -121,12 +126,7 @@ struct ConnectionTopologyView: View {
         .accessibilityAction(named: "下移") { move(device.id, true) }
     }
     private func initialPosition(_ device: TopologyDevice, _ size: CGSize) -> CGPoint {
-        // Initial placement follows stable IDs. Priority remains independent of position.
-        let ids = devices.map(\.id).sorted { $0.uuidString < $1.uuidString }
-        let index = ids.firstIndex(of: device.id) ?? 0
-        let angle = devices.count == 1 ? Double.pi / 2 : Double.pi + Double(index) * 2 * .pi / Double(max(1, devices.count))
-        return CGPoint(x: size.width / 2 + cos(angle) * max(0, size.width / 2 - nodeWidth(size) / 2 - 14),
-                       y: size.height / 2 + sin(angle) * max(0, size.height / 2 - nodeHeight / 2 - 14))
+        TopologyLayout.initialPosition(device.id, ids: devices.map(\.id), size: size)
     }
     private func point(_ device: TopologyDevice, in size: CGSize) -> CGPoint {
         if let drag, drag.id == device.id { return drag.center }
@@ -142,15 +142,25 @@ struct ConnectionTopologyView: View {
         return CGPoint(x: min(max(inset, point.x), max(inset, size.width - inset)),
                        y: min(max(verticalInset, point.y), max(verticalInset, size.height - verticalInset)))
     }
-    private func saveInitialPositions(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-        var missing: [UUID: NodePosition] = [:]
-        for device in devices where device.position == nil {
-            let center = clamp(initialPosition(device, size), size)
-            missing[device.id] = NodePosition(x: center.x / size.width, y: center.y / size.height)
+    private func saveInitialPositions(_ size: CGSize) { settle(size) }
+    private func settle(_ size: CGSize, preferred: UUID? = nil) {
+        guard size.width > 0, size.height > 0, drag == nil else { return }
+        let saved = Dictionary(uniqueKeysWithValues: devices.compactMap { device in
+            (pendingPositions[device.id] ?? device.position).map { (device.id, $0) }
+        })
+        let layout = TopologyLayout.arrange(ids: devices.map(\.id), saved: saved, size: size, preferred: preferred)
+        var changed: [UUID: NodePosition] = [:]
+        for device in devices {
+            guard let position = layout.positions[device.id] else { continue }
+            if device.position.map({ abs($0.x - position.x) < 0.000001 && abs($0.y - position.y) < 0.000001 }) != true {
+                pendingPositions[device.id] = position
+                changed[device.id] = position
+            }
         }
-        if !missing.isEmpty { place(missing) }
+        if layout.size.height > size.height + 0.5 || layout.size.width > size.width + 0.5 { resize(layout.size) }
+        if !changed.isEmpty { place(changed) }
     }
+
 }
 
 /// Packet updates invalidate the drawing layer, without invalidating the drag owner.

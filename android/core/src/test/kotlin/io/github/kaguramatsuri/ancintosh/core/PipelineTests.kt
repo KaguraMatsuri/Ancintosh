@@ -98,3 +98,29 @@ class PipelineTests {
         assertEquals(0, written.get()); channel.close()
     }
 }
+
+class ReplyQueueTests {
+    @Test fun boundedRepliesDoNotWaitForTheStalledWriterAndCloseReleasesWaiters() = runBlocking {
+        withTimeout(5000) {
+            val released = CompletableDeferred<Unit>()
+            val raw = object : ByteChannel {
+                override suspend fun readExactly(count: Int): ByteArray = error("No reader")
+                override suspend fun write(data: ByteArray) { released.await() }
+                override fun close() { released.complete(Unit) }
+            }
+            val local = Hello(Role.ANDROID, UUID.randomUUID(), nonce = ByteArray(32) { 1 }, publicKey = ByteArray(32) { 9 })
+            val remote = Hello(Role.MAC, UUID.randomUUID(), nonce = ByteArray(32) { 2 }, publicKey = ByteArray(32) { 9 })
+            val auth = Authentication(remote.peer,CryptoSession(ByteArray(32) { 3 },local,remote,Transport.tcp,ByteArray(32) { 9 }))
+            val channel = EncryptedChannel(raw,auth,Transport.tcp)
+            val accepted = AtomicInteger()
+            val producer = async(Dispatchers.Default) {
+                runCatching { repeat(17) { channel.reply(Record(RecordKind.ACK)); accepted.incrementAndGet() } }
+            }
+            try {
+                withTimeout(1000) { while (accepted.get() < 16) yield() }
+                delay(10); assertEquals(16,accepted.get())
+                channel.close(); assertTrue(producer.await().isFailure)
+            } finally { channel.close() }
+        }
+    }
+}

@@ -7,6 +7,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
@@ -18,6 +22,9 @@ sealed interface SyncEvent {
     data class Progress(val id: UUID, val offset: Long, val size: Long) : SyncEvent
     data class Failed(val id: UUID, val code: Failure) : SyncEvent
     data class Completed(val id: UUID) : SyncEvent
+    data class TransferStarted(val peer: UUID, val manifest: Manifest, val sending: Boolean) : SyncEvent
+    data class TransferStopped(val id: UUID) : SyncEvent
+    data class TransportChanged(val tcp: Boolean) : SyncEvent
     data class Offer(val peer: UUID, val context: UUID, val addresses: List<Pair<String, Int>>, val binding: ByteArray) : SyncEvent
     data class Configuration(val value: ManagedConfiguration, val json: String) : SyncEvent
     data class ConfigurationRejected(val request: UUID, val code: Failure) : SyncEvent
@@ -30,6 +37,8 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     private val state = Mutex()
     private val queue = mutableListOf<OutboundJob>()
     private var pumping = false
+    @Volatile private var graceful = false
+    @Volatile private var closedWaiter: CompletableDeferred<Unit>? = null
     @Volatile private var peer: UUID? = null
     @Volatile private var ble: EncryptedChannel? = null
     @Volatile private var tcp: EncryptedChannel? = null
@@ -37,7 +46,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     @Volatile private var epoch: UUID = Wire.ZERO_ID
     @Volatile private var awaitingFallback = false
     private var currentClipboard: File? = null
-    private val lastProgress = mutableMapOf<UUID, Long>()
+    private val lastProgress = java.util.concurrent.ConcurrentHashMap<UUID, Long>()
     var wifi = true; private set
     @Volatile private var remoteWifi = true
     @Volatile private var remoteConfiguration = false
@@ -50,18 +59,20 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     private var notificationGeneration = UUID.randomUUID()
     val sharesNotifications: Boolean get() = notificationsEnabled
     val connected: UUID? get() = peer
+    val usingTCP: Boolean get() = tcp != null
+    val permitsWifi: Boolean get() = wifi && remoteWifi && ble != null
     private fun preference(): ByteArray = JSONObject().put("enabled", wifi).put("configuration", true)
         .put("notifications", localNotificationAccess.copy(enabled = notificationsEnabled).json()).bytes()
     suspend fun notificationAccess(value: NotificationAccess) {
         if (localNotificationAccess == value) return
         localNotificationAccess = value
         if (!value.capture) clearNotifications()
-        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
+        ble?.reply(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
     }
     suspend fun notificationPolicy(enabled: Boolean) {
         notificationsEnabled = enabled
         if (!enabled) clearNotifications()
-        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
+        ble?.reply(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
     }
     private suspend fun clearNotifications() = notificationLock.withLock {
         notificationGeneration = UUID.randomUUID(); notificationJob?.cancel(); notificationJob = null; notificationQueue.clear()
@@ -92,7 +103,10 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         }
     }
     suspend fun outgoingFiles(): List<OutboundJob> = state.withLock { queue.filter { it.snapshot.manifest.kind == PayloadKind.FILE }.map { it.copy() } }
-    suspend fun restore() = state.withLock { queue.addAll(store.restore()) }
+    suspend fun restore() = state.withLock {
+        store.restore().forEach { restored -> if (queue.none { it.peer == restored.peer && it.snapshot.manifest.id == restored.snapshot.manifest.id }) queue.add(restored) }
+        store.collectOutgoing(queue.map { it.snapshot.file }.toSet())
+    }
 
     suspend fun installBLE(auth: Authentication, channel: EncryptedChannel) {
         ble?.close(); tcp?.close(); tcp = null; ble = channel; peer = auth.peer; offer = null
@@ -101,10 +115,14 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         epoch = UUID(root.long, root.long); awaitingFallback = false
         channel.setDataEpoch(epoch)
         store.selectEpoch(auth.peer, epoch)
-        state.withLock {
+        val obsolete = state.withLock {
+            val removed = queue.filter { it.snapshot.manifest.kind != PayloadKind.FILE }.map { it.snapshot.file }
             queue.removeAll { it.snapshot.manifest.kind != PayloadKind.FILE }
             queue.forEach { it.begun = false; it.waiting = false; it.finished = false }
+            removed
         }
+        obsolete.forEach(store::release)
+        lastProgress.clear()
         scope.launch { readLoop(channel, false) }
         channel.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
         events(SyncEvent.Connected(auth.peer)); pump()
@@ -115,39 +133,78 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         epoch = context; awaitingFallback = false
         ble?.setDataEpoch(null); channel.setDataEpoch(epoch)
         peer?.let { store.selectEpoch(it, epoch) }
-        reset(); scope.launch { readLoop(channel, true) }; pump()
+        reset(); scope.launch { readLoop(channel, true) }; events(SyncEvent.TransportChanged(true)); pump()
     }
     suspend fun wifi(enabled: Boolean) {
         wifi = enabled
         if (!enabled && tcp != null) tcpLost()
-        ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
+        ble?.reply(Record(RecordKind.WIFI_PREFERENCE, metadata = preference()))
         pump()
     }
-    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.send(Record(RecordKind.WIFI_PREFERENCE, metadata = preference())) }
+    suspend fun requestUpgrade() { if (wifi && ble != null) ble?.reply(Record(RecordKind.WIFI_PREFERENCE, metadata = JSONObject(preference().toString(Charsets.UTF_8)).put("requestTCP", true).bytes())) }
     suspend fun reportDevice(information: DeviceInformation) {
-        if (remoteConfiguration) ble?.send(Record(RecordKind.DEVICE_INFORMATION, metadata = information.json().bytes()))
+        if (remoteConfiguration) ble?.reply(Record(RecordKind.DEVICE_INFORMATION, metadata = information.json().bytes()))
     }
     suspend fun tcpLost() {
         val previous = tcp; tcp = null; offer = null; awaitingFallback = true; previous?.close()
         ble?.setDataEpoch(null)
         peer?.let(store::checkpoint); reset()
-        ble?.send(Record(RecordKind.TRANSPORT_SWITCH, metadata = JSONObject().put("transport", "ble").bytes()))
+        ble?.reply(Record(RecordKind.TRANSPORT_SWITCH, metadata = JSONObject().put("transport", "ble").bytes()))
+        events(SyncEvent.TransportChanged(false))
     }
-    suspend fun disconnect(intentional: Boolean = false) {
+    suspend fun closeGracefully() {
+        val channel = ble ?: return
+        val waiter = CompletableDeferred<Unit>()
+        graceful = true; closedWaiter = waiter
+        try {
+            withTimeoutOrNull(2000) {
+                channel.setDataEpoch(null)
+                channel.send(Record(RecordKind.GOODBYE))
+                waiter.await()
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { /* An unavailable link must not prevent local teardown. */ }
+        finally {
+            try { withContext(NonCancellable) { disconnect(true, notify = false) } }
+            finally { if (closedWaiter === waiter) closedWaiter = null; graceful = false }
+        }
+    }
+    fun abortChannels() {
+        peer = null
+        ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
+        store.closeHandles(); closedWaiter?.complete(Unit)
+    }
+    suspend fun disconnect(intentional: Boolean = false, notify: Boolean = true) {
         val current = peer ?: return
-        if (intentional) runCatching { ble?.send(Record(RecordKind.GOODBYE)) }
-        peer = null; clearNotifications(); remoteNotificationAccess = null; ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
-        store.checkpoint(current); store.closeHandles(); reset(); events(SyncEvent.Disconnected(current, intentional))
+        if (intentional && notify) runCatching { ble?.send(Record(RecordKind.GOODBYE)) }
+        val waiter = closedWaiter
+        peer = null
+        try {
+            clearNotifications(); remoteNotificationAccess = null
+            ble?.close(); ble = null; tcp?.close(); tcp = null; offer = null
+            try { store.checkpoint(current) } finally { store.closeHandles() }
+            val obsolete = state.withLock {
+                val removed = queue.filter { it.snapshot.manifest.kind != PayloadKind.FILE }.map { it.snapshot.file }
+                queue.removeAll { it.snapshot.manifest.kind != PayloadKind.FILE }
+                queue.forEach { it.begun = false; it.waiting = false; it.finished = false }; store.persist(queue)
+                removed
+            }
+            obsolete.forEach(store::release); lastProgress.clear()
+            events(SyncEvent.Disconnected(current, intentional || graceful))
+        } finally { waiter?.complete(Unit) }
     }
     suspend fun enqueue(snapshot: Snapshot) {
         val target = peer ?: fail(Failure.peerUnavailable)
-        state.withLock {
+        val obsolete = state.withLock {
+            val previous = queue.map { it.snapshot.file }.toSet()
             if (snapshot.manifest.kind != PayloadKind.FILE) {
                 queue.removeAll { !it.begun && it.snapshot.manifest.kind != PayloadKind.FILE }
                 queue.add(0, OutboundJob(target, snapshot, true))
             } else queue.add(OutboundJob(target, snapshot, true))
             store.persist(queue)
+            previous - queue.map { it.snapshot.file }.toSet()
         }
+        obsolete.forEach(store::release)
         pump()
     }
     suspend fun retry(id: UUID) {
@@ -160,9 +217,11 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             queue.removeAll { it.snapshot.manifest.id == id }; store.persist(queue); source
         }
         if (source != null) store.release(source)
+        peer?.let { store.cancel(it, id) }
+        lastProgress.remove(id); events(SyncEvent.TransferStopped(id))
         (tcp ?: ble)?.discardBuffered(id)
-        runCatching { (tcp ?: ble)?.send(Record(RecordKind.CANCEL, id, epoch = epoch)) }
-        peer?.let { store.cancel(it, id) }; pump()
+        runCatching { (tcp ?: ble)?.reply(Record(RecordKind.CANCEL, id, epoch = epoch)) }
+        pump()
     }
     private suspend fun reset() = state.withLock { queue.forEach { it.begun = false; it.waiting = false; it.finished = false }; store.persist(queue) }
     private fun nextReadyJob(): OutboundJob? {
@@ -174,7 +233,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
     private suspend fun drain() {
         state.withLock { if (pumping) return; pumping = true }
         try {
-            while (peer != null && !awaitingFallback) {
+            while (peer != null && !awaitingFallback && !graceful) {
                 val channel = tcp ?: ble ?: return
                 val job = state.withLock { nextReadyJob()?.copy() } ?: return
                 val selectedEpoch = epoch
@@ -212,8 +271,10 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                         events(SyncEvent.Progress(job.snapshot.manifest.id, progress, job.snapshot.manifest.size))
                     }
                 } catch (error: Exception) {
+                    if (graceful) return
                     if (error is ProtocolException && error.code == Failure.cancelled) continue
                     if (error is ProtocolException && error.code == Failure.sourceUnavailable) {
+                        lastProgress.remove(job.snapshot.manifest.id)
                         state.withLock { queue.firstOrNull { it.snapshot.manifest.id == job.snapshot.manifest.id }?.failed = error.code; store.persist(queue) }; events(SyncEvent.Failed(job.snapshot.manifest.id, error.code))
                     } else {
                         reset()
@@ -227,7 +288,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                 pumping = false
                 nextReadyJob() != null
             }
-            if (ready && peer != null && !awaitingFallback) pump()
+            if (ready && peer != null && !awaitingFallback && !graceful) pump()
         }
     }
     private suspend fun readLoop(channel: EncryptedChannel, isTCP: Boolean) {
@@ -239,7 +300,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             }
         } catch (_: Exception) {
             if ((if (isTCP) tcp else ble) !== channel) return
-            if (isTCP) tcpLost() else disconnect()
+            if (isTCP) tcpLost() else disconnect(graceful, notify = false)
         }
     }
     private suspend fun receive(record: Record, channel: EncryptedChannel, isTCP: Boolean) {
@@ -251,13 +312,27 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
             when (record.kind) {
                 RecordKind.BEGIN -> {
                     val manifest = Manifest.decode(record.json()); if (manifest.id != record.id) fail(Failure.invalidManifest)
-                    channel.send(Record(RecordKind.RESUME, record.id, store.begin(manifest, current, record.epoch), epoch = record.epoch))
+                    val offset = store.begin(manifest, current, record.epoch)
+                    if (peer != current || record.epoch != epoch || channel !== (tcp ?: ble)) return
+                    events(SyncEvent.TransferStarted(current, manifest, false))
+                    events(SyncEvent.Progress(record.id, offset, manifest.size))
+                    channel.reply(Record(RecordKind.RESUME, record.id, offset, epoch = record.epoch))
                 }
-                RecordKind.DATA -> store.append(current, record.id, record.offset, record.bytes, record.epoch)?.let {
-                    channel.send(Record(RecordKind.ACK, record.id, it, JSONObject().put("complete", false).bytes(), epoch = record.epoch))
+                RecordKind.DATA -> {
+                    store.append(current, record.id, record.offset, record.bytes, record.epoch)?.let {
+                        channel.reply(Record(RecordKind.ACK, record.id, it, JSONObject().put("complete", false).bytes(), epoch = record.epoch))
+                    }
+                    store.incomingSize(current, record.id)?.let { size ->
+                        val offset = record.offset + record.bytes.size
+                        val now = System.nanoTime()
+                        if (offset == size || now - (lastProgress[record.id] ?: 0L) >= 200_000_000L) {
+                            lastProgress[record.id] = now; events(SyncEvent.Progress(record.id, offset, size))
+                        }
+                    }
                 }
                 RecordKind.FINISH -> {
                     val result = store.finish(current, record.id, record.epoch)
+                    if (peer != current || record.epoch != epoch || channel !== (tcp ?: ble)) return
                     if (result.fresh) {
                         events(SyncEvent.Delivered(current, result)); store.delivered(current, record.id)
                         if (result.manifest.kind != PayloadKind.FILE) {
@@ -266,7 +341,8 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                             store.collectClipboard(retained + result.file)
                         }
                     }
-                    channel.send(Record(RecordKind.ACK, record.id, result.manifest.size, JSONObject().put("complete", true).bytes(), epoch = record.epoch))
+                    channel.reply(Record(RecordKind.ACK, record.id, result.manifest.size, JSONObject().put("complete", true).bytes(), epoch = record.epoch))
+                    lastProgress.remove(record.id); events(SyncEvent.TransferStopped(record.id))
                 }
                 RecordKind.RESUME -> state.withLock {
                     queue.firstOrNull { it.snapshot.manifest.id == record.id }?.let {
@@ -280,9 +356,16 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                         if (record.offset != job.snapshot.manifest.size) fail(Failure.invalidOffset)
                         queue.remove(job); store.persist(queue); job
                     }
-                    job?.let { store.release(it.snapshot.file); events(SyncEvent.Completed(record.id)) }
+                    job?.let { store.release(it.snapshot.file); lastProgress.remove(record.id); events(SyncEvent.Completed(record.id)) }
                 }
-                RecordKind.CANCEL -> { state.withLock { queue.removeAll { it.snapshot.manifest.id == record.id }; store.persist(queue) }; store.cancel(current, record.id) }
+                RecordKind.CANCEL -> {
+                    val removed = state.withLock {
+                        val removed = queue.filter { it.snapshot.manifest.id == record.id }.map { it.snapshot.file }
+                        queue.removeAll { it.snapshot.manifest.id == record.id }; store.persist(queue); removed
+                    }
+                    channel.discardBuffered(record.id); removed.forEach(store::release)
+                    store.cancel(current, record.id); lastProgress.remove(record.id); events(SyncEvent.TransferStopped(record.id))
+                }
                 RecordKind.WIFI_PREFERENCE -> {
                     if (isTCP) fail(Failure.invalidFrame)
                     remoteWifi = record.json().getBoolean("enabled")
@@ -300,7 +383,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                     offer = context
                     events(SyncEvent.Offer(current, context, addresses, Crypto.derive(channel.root, secret, "Andcintosh/v2/tcp-binding")))
                 }
-                RecordKind.GOODBYE -> { if (isTCP) fail(Failure.invalidFrame); disconnect(true) }
+                RecordKind.GOODBYE -> { if (isTCP) fail(Failure.invalidFrame); disconnect(true, notify = false) }
                 RecordKind.TRANSPORT_SWITCH -> {
                     if (isTCP || record.epoch == Wire.ZERO_ID || record.json().getString("transport") != "ble") fail(Failure.invalidFrame)
                     val previous = tcp; tcp = null; previous?.close(); offer = null
@@ -320,6 +403,7 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
                         val job = queue.firstOrNull { it.snapshot.manifest.id == record.id } ?: return@withLock false
                         job.failed = code; store.persist(queue); true
                     }
+                    lastProgress.remove(record.id)
                     if (pending) events(SyncEvent.Failed(record.id, code))
                 }
                 RecordKind.CONFIGURATION -> {
@@ -340,13 +424,15 @@ class SessionController(val identity: UUID, private val scope: CoroutineScope, p
         } catch (error: ProtocolException) {
             if (transfer && record.epoch != epoch) return
             if (record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH, RecordKind.RESUME)) {
-                channel.send(Record(RecordKind.FAILURE, record.id, metadata = JSONObject().put("code", error.code.name).bytes(), epoch = record.epoch))
+                lastProgress.remove(record.id)
+                channel.reply(Record(RecordKind.FAILURE, record.id, metadata = JSONObject().put("code", error.code.name).bytes(), epoch = record.epoch))
                 events(SyncEvent.Failed(record.id, error.code))
             } else throw error
         } catch (error: Exception) {
             if (record.kind in listOf(RecordKind.BEGIN, RecordKind.DATA, RecordKind.FINISH)) {
                 val code = if (error is SecurityException) Failure.permissionDenied else Failure.sourceUnavailable
-                channel.send(Record(RecordKind.FAILURE, record.id, metadata = JSONObject().put("code", code.name).bytes(), epoch = record.epoch))
+                lastProgress.remove(record.id)
+                channel.reply(Record(RecordKind.FAILURE, record.id, metadata = JSONObject().put("code", code.name).bytes(), epoch = record.epoch))
                 events(SyncEvent.Failed(record.id, code))
             } else throw error
         }

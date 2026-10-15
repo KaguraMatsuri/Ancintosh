@@ -1,5 +1,9 @@
 package io.github.kaguramatsuri.ancintosh.ui
 
+import androidx.compose.foundation.Image
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -100,13 +104,17 @@ fun SettingsScreen(model: SettingsViewModel, start: () -> Unit, sendFiles: () ->
             items(state.transfers, key = { it.id }) { transfer ->
                 val progressLabel = stringResource(R.string.progress)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(transfer.name)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Image(painterResource(if (transfer.sending) android.R.drawable.arrow_up_float else android.R.drawable.arrow_down_float),
+                            contentDescription = null, modifier = Modifier.size(16.dp), colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onSurface))
+                        Text(transfer.name)
+                    }
                     LinearProgressIndicator(progress = { (transfer.bytes.toDouble() / maxOf(1, transfer.size)).toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().semantics { contentDescription = progressLabel })
                     Text("${android.text.format.Formatter.formatFileSize(context, transfer.bytes)} / ${android.text.format.Formatter.formatFileSize(context, transfer.size)}")
                     if (transfer.failure != null) Text(stringResource(failureText(transfer.failure)))
                     else if (state.peer == null) Text(stringResource(R.string.paused))
                     FlowRow {
-                        if (transfer.failure != null) TextButton(onClick = { model.retry(transfer.id) }, enabled = !model.busy && state.peer != null) { Text(stringResource(R.string.retry)) }
+                        if (transfer.sending && transfer.failure != null) TextButton(onClick = { model.retry(transfer.id) }, enabled = !model.busy && state.peer != null) { Text(stringResource(R.string.retry)) }
                         TextButton(onClick = { model.cancel(transfer.id) }, enabled = !model.busy) { Text(stringResource(R.string.cancel)) }
                     }
                 }

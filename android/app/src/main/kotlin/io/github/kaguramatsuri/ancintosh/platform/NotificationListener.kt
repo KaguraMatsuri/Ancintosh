@@ -31,7 +31,8 @@ internal object NotificationBridge {
 }
 
 class NotificationListener : NotificationListenerService() {
-    private val identifiers = linkedMapOf<String, UUID>()
+    private val sourceIdentity by lazy { DeviceSettings(this).identity }
+    private fun identifier(key: String): UUID = NotificationMessage.sourceID(sourceIdentity, key)
     private data class Input(val target: NotificationTarget, val id: UUID, val application: String, val title: String, val body: String, val removed: Boolean)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inputs = Channel<Input>(128, BufferOverflow.DROP_OLDEST)
@@ -55,14 +56,11 @@ class NotificationListener : NotificationListenerService() {
         }
     }
     override fun onListenerConnected() { NotificationBridge.connected = true; NotificationBridge.changed() }
-    override fun onListenerDisconnected() { NotificationBridge.connected = false; identifiers.clear(); NotificationBridge.changed() }
+    override fun onListenerDisconnected() { NotificationBridge.connected = false; NotificationBridge.changed() }
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val target = NotificationBridge.target() ?: return
         if (sbn.packageName == packageName || sbn.notification.flags and (Notification.FLAG_ONGOING_EVENT or Notification.FLAG_GROUP_SUMMARY) != 0) return
-        val id = identifiers[sbn.key] ?: UUID.randomUUID().also {
-            if (identifiers.size == 128) identifiers.remove(identifiers.keys.first())
-            identifiers[sbn.key] = it
-        }
+        val id = identifier(sbn.key)
         val extras = sbn.notification.extras
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
@@ -70,12 +68,13 @@ class NotificationListener : NotificationListenerService() {
         inputs.trySend(Input(target, id, sbn.packageName, title, body, false))
     }
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
-        val id = identifiers.remove(sbn.key) ?: return
+        if (sbn.packageName == packageName) return
+        val id = identifier(sbn.key)
         val target = NotificationBridge.target() ?: return
         inputs.trySend(Input(target, id, "", "", "", true))
     }
     override fun onDestroy() {
-        NotificationBridge.connected = false; identifiers.clear(); NotificationBridge.changed()
+        NotificationBridge.connected = false; NotificationBridge.changed()
         inputs.close(); scope.cancel(); super.onDestroy()
     }
 }

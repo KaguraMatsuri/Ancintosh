@@ -67,6 +67,7 @@ public struct MacTransfer: Identifiable, Sendable {
     public let size: UInt64
     public var bytes: UInt64 = 0
     public var failure: ProtocolFailure?
+    public var sending = true
 }
 
 @MainActor @Observable
@@ -81,6 +82,29 @@ public final class MacRuntime {
     public let isDemonstration: Bool
     public private(set) var progress: [UUID: (UInt64, UInt64)] = [:]
     public private(set) var failures: [UUID: ProtocolFailure] = [:]
+    enum FailureSource: Hashable { case connection, clipboard(Bool), transfer(UUID), notification, configuration }
+    private struct FailureEntry { let code: ProtocolFailure; let order: UInt64 }
+    @ObservationIgnored private var failureSources: [UUID: [FailureSource: FailureEntry]] = [:]
+    @ObservationIgnored private var failureOrder: UInt64 = 0
+    private func failurePeer(_ peer: UUID) -> UUID {
+        configuration.peers.first(where: { $0.id == peer || $0.identity == peer })?.id ?? peer
+    }
+    func recordFailure(_ peer: UUID, _ error: ProtocolFailure, source: FailureSource) {
+        let peer = failurePeer(peer)
+        failureOrder &+= 1
+        failureSources[peer, default: [:]][source] = FailureEntry(code: error, order: failureOrder)
+        refreshFailure(peer)
+    }
+    func clearFailure(_ peer: UUID, source: FailureSource) {
+        let peer = failurePeer(peer)
+        guard failureSources[peer]?.removeValue(forKey: source) != nil else { return }
+        if failureSources[peer]?.isEmpty == true { failureSources.removeValue(forKey: peer) }
+        refreshFailure(peer)
+    }
+    private func refreshFailure(_ peer: UUID) {
+        let latest = failureSources[peer]?.values.max(by: { $0.order < $1.order })?.code
+        if failures[peer] != latest { failures[peer] = latest }
+    }
     public private(set) var preparing = false
     public private(set) var running = false
     public private(set) var transfers: [UUID: MacTransfer] = [:]
@@ -99,7 +123,7 @@ public final class MacRuntime {
     private var notificationPermissionsTask: Task<Void, Never>?
     @ObservationIgnored private lazy var notificationPresenter: MacNotificationPresenter = {
         let presenter = MacNotificationPresenter()
-        presenter.failed = { [weak self] peer, error in self?.failures[peer] = error }
+        presenter.failed = { [weak self] peer, error in self?.recordFailure(peer, error, source: .notification) }
         return presenter
     }()
     @ObservationIgnored private lazy var notificationSource = makeNotificationSource()
@@ -109,7 +133,7 @@ public final class MacRuntime {
             guard let self, self.running else { return }
             self.capturedNotification(value)
         }
-        source.failed = { [weak self] error in guard let self else { return }; self.failures[self.configuration.identity] = error }
+        source.failed = { [weak self] error in guard let self else { return }; self.recordFailure(self.configuration.identity, error, source: .notification) }
         return source
     }
     private func capturedNotification(_ value: NotificationMessage) {
@@ -133,6 +157,10 @@ public final class MacRuntime {
     private var restored = false
     private var lan = false
     private var offers: [UUID: Task<Void, Never>] = [:]
+    private var offerTokens: [UUID: UUID] = [:]
+    private var offerBackoffs: [UUID: RecoveryBackoff] = [:]
+    private var fileTasks: [UUID: Task<Void, any Error>] = [:]
+    private var fileGeneration = UUID()
     private var configurationWrites: [UUID: [UUID: ManagedConfiguration]] = [:]
     private var configurationWorkers: [UUID: Task<Void, Never>] = [:]
     private var configurationGenerations: [UUID: UUID] = [:]
@@ -158,7 +186,7 @@ public final class MacRuntime {
     @ObservationIgnored private lazy var bluetooth: any RuntimeConnector = {
         let client = services.connector(configuration.identity, coordinator)
         client.discovered = { [weak self] peer in self?.discovered[peer.identifier] = peer }
-        client.failed = { [weak self] id, failure in self?.failures[id] = failure }
+        client.failed = { [weak self] id, failure in self?.recordFailure(id, failure, source: .connection) }
         client.signal = { [weak self] id, event in self?.wireSignal(id, event, logical: false) }
         client.associated = { [weak self] id, identity in
             guard let self, let index = self.configuration.peers.firstIndex(where: { $0.id == id }) else { return }
@@ -215,12 +243,20 @@ public final class MacRuntime {
             }
         }
         if enabled && !isDemonstration {
+            await migrateNotificationIDs(id)
             _ = notificationSource.request()
             _ = try await notificationPresenter.request()
             await refreshNotificationPermissions()
             guard notificationAllowed else { throw ProtocolFailure.permissionDenied }
         }
         updateNotificationCapture()
+    }
+    private func migrateNotificationIDs(_ profile: UUID) async {
+        guard !isDemonstration, let peer = configuration.peers.first(where: { $0.id == profile })?.identity else { return }
+        let key = "Andcintosh.notificationIDs.2." + profile.uuidString
+        guard preferences?.bool(forKey: key) != true else { return }
+        await notificationPresenter.clear(peer: peer)
+        preferences?.set(true, forKey: key)
     }
     private func refreshNotificationPermissions() async {
         if isDemonstration { notificationAllowed = true; return }
@@ -235,7 +271,10 @@ public final class MacRuntime {
         let eligible = running && notificationSource.permitted && connected.contains { peer in
             configuration.peers.first(where: { $0.identity == peer })?.notifications == true && notificationPeers[peer]?.display == true
         }
-        if eligible { notificationSource.start() } else { notificationSource.stop() }
+        if eligible {
+            clearFailure(configuration.identity, source: .notification)
+            notificationSource.start()
+        } else { notificationSource.stop() }
     }
 
     #if DEBUG
@@ -325,7 +364,7 @@ public final class MacRuntime {
         configureLock()
         for profile in configuration.peers {
             do { try bluetooth.connect(identifier: profile.id, key: services.loadKey(profile.id), expectedIdentity: profile.identity) }
-            catch { failures[profile.id] = error as? ProtocolFailure ?? .peerUnavailable }
+            catch { recordFailure(profile.id, error as? ProtocolFailure ?? .peerUnavailable, source: .connection) }
         }
         pasteboard.changed = { [weak self] file, text, mime in
             guard let self else { return }
@@ -357,7 +396,7 @@ public final class MacRuntime {
                         transfers[job.manifest.id] = MacTransfer(id: job.manifest.id, peer: job.peer, name: job.manifest.name,
                                                                size: job.manifest.size, bytes: job.offset, failure: job.failure)
                     }
-                } catch { failures[configuration.identity] = error as? ProtocolFailure ?? .sourceUnavailable }
+                } catch { recordFailure(configuration.identity, error as? ProtocolFailure ?? .sourceUnavailable, source: .configuration) }
             }
             #if DEBUG
             if isDemonstration { await coordinator.notificationAccess(NotificationAccess(capture: true, display: true)) }
@@ -436,6 +475,7 @@ public final class MacRuntime {
     }
     public func scan() { start(); discovered.removeAll(); bluetooth.scan() }
     public func save(_ profile: PeerProfile, key: String) async throws {
+        try validateName(profile.name ?? profile.id.uuidString, mac: false, profile: profile)
         let bytes = key.isEmpty ? try services.loadKey(profile.id) : try Crypto.key(key)
         start()
         if let existing = configuration.peers.first(where: { $0.id == profile.id }), let peer = existing.identity { await coordinator.stop(peer) }
@@ -453,8 +493,7 @@ public final class MacRuntime {
     }
     public func connect(_ profile: PeerProfile) throws {
         start()
-        failures.removeValue(forKey: profile.id)
-        if let identity = profile.identity { failures.removeValue(forKey: identity) }
+        clearFailure(profile.id, source: .connection)
         #if DEBUG
         if let demo = bluetooth as? DemoPeer { demo.allow(profile.id) }
         #endif
@@ -463,8 +502,8 @@ public final class MacRuntime {
     public func wifi(_ enabled: Bool) async {
         configuration.wifi = enabled; configurationChanged(devices: [])
         await coordinator.wifi(enabled && lan)
-        if enabled && lan { for peer in connected { scheduleOffer(peer) } }
-        else { for task in offers.values { task.cancel() }; offers.removeAll(); if !isDemonstration { await server.stop() } }
+        if enabled && lan { for peer in connected { scheduleOffer(peer, reset: true) } }
+        else { cancelOffers(); if !isDemonstration { await server.stop() } }
     }
     public func lock(enabled: Bool, primary: UUID?) throws {
         let identity = configuration.peers.first(where: { $0.id == primary })?.identity
@@ -485,26 +524,48 @@ public final class MacRuntime {
         return allowed
     }
     public func files(_ urls: [URL], peer: UUID) async throws {
-        guard connected.contains(peer) else { throw ProtocolFailure.peerUnavailable }
+        guard running, connected.contains(peer) else { throw ProtocolFailure.peerUnavailable }
+        let token = UUID(), generation = fileGeneration
         preparing = true
-        defer { preparing = false }
-        for url in urls {
-            let accessed = url.startAccessingSecurityScopedResource()
-            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
-            guard values.isRegularFile == true else { throw ProtocolFailure.unsupported }
-            let snapshot = try await store.snapshot(url, kind: .file, name: url.lastPathComponent,
-                                                    mime: values.contentType?.preferredMIMEType ?? "application/octet-stream", origin: configuration.identity)
-            transfers[snapshot.manifest.id] = MacTransfer(id: snapshot.manifest.id, peer: peer, name: snapshot.manifest.name, size: snapshot.manifest.size)
-            #if DEBUG
-            if isDemonstration {
-                demonstrationJobs.insert(snapshot.manifest.id)
-                expectedReplies[peer, default: [:]][snapshot.manifest.sha256, default: 0] += 1
-                demonstrationResult = DemonstrationResult(peer: peer, test: .file)
+        let task = Task<Void, any Error> { [self] in
+            defer { fileTasks.removeValue(forKey: token); preparing = !fileTasks.isEmpty }
+            for url in urls {
+                try Task.checkCancellation()
+                guard generation == fileGeneration, running, connected.contains(peer) else { throw ProtocolFailure.peerUnavailable }
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
+                guard values.isRegularFile == true else { throw ProtocolFailure.unsupported }
+                let snapshot = try await store.snapshot(url, kind: .file, name: url.lastPathComponent,
+                    mime: values.contentType?.preferredMIMEType ?? "application/octet-stream", origin: configuration.identity)
+                if Task.isCancelled || generation != fileGeneration || !running || !connected.contains(peer) {
+                    await store.release(snapshot.url)
+                    throw CancellationError()
+                }
+                transfers[snapshot.manifest.id] = MacTransfer(id: snapshot.manifest.id, peer: peer,
+                    name: snapshot.manifest.name, size: snapshot.manifest.size)
+                do {
+                    #if DEBUG
+                    if isDemonstration {
+                        demonstrationJobs.insert(snapshot.manifest.id)
+                        expectedReplies[peer, default: [:]][snapshot.manifest.sha256, default: 0] += 1
+                        demonstrationResult = DemonstrationResult(peer: peer, test: .file)
+                    }
+                    #endif
+                    try await coordinator.enqueue(snapshot, targets: [peer], userInitiated: true)
+                } catch {
+                    if await coordinator.outgoingFiles().contains(where: { $0.peer == peer && $0.manifest.id == snapshot.manifest.id }) {
+                        transfers[snapshot.manifest.id]?.failure = error as? ProtocolFailure ?? .sourceUnavailable
+                    } else {
+                        transfers.removeValue(forKey: snapshot.manifest.id)
+                        await store.release(snapshot.url)
+                    }
+                    throw error
+                }
             }
-            #endif
-            try await coordinator.enqueue(snapshot, targets: [peer], userInitiated: true)
         }
+        fileTasks[token] = task
+        try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
     public func retry(_ id: UUID, peer: UUID) async throws {
         transfers[id]?.failure = nil
@@ -514,6 +575,10 @@ public final class MacRuntime {
         await coordinator.cancel(id, peer: peer); transfers.removeValue(forKey: id)
     }
     public func stop() async {
+        fileGeneration = UUID()
+        let preparingFiles = Array(fileTasks.values)
+        for task in preparingFiles { task.cancel() }
+        for task in preparingFiles { _ = await task.result }
         #if DEBUG
         demonstrationTask?.cancel()
         _ = try? await demonstrationTask?.value
@@ -527,7 +592,7 @@ public final class MacRuntime {
         pendingClipboard = nil; clipboardPreparation?.cancel(); clipboardWorker?.cancel()
         await clipboardWorker?.value
         locker.stop(); pasteboard.stop(); monitor?.cancel(); monitor = nil; lan = false
-        for task in offers.values { task.cancel() }; offers.removeAll()
+        cancelOffers()
         for task in configurationWorkers.values { task.cancel() }
         configurationWorkers.removeAll(); configurationWrites.removeAll(); configurationGenerations.removeAll()
         configurationReady.removeAll()
@@ -599,22 +664,53 @@ public final class MacRuntime {
         guard running else { return }
         lan = available
         await coordinator.wifi(configuration.wifi && available)
-        if configuration.wifi && available { for peer in connected { scheduleOffer(peer) } }
-        else { for task in offers.values { task.cancel() }; offers.removeAll(); if !isDemonstration { await server.stop() } }
+        if configuration.wifi && available { for peer in connected { scheduleOffer(peer, reset: true) } }
+        else { cancelOffers(); if !isDemonstration { await server.stop() } }
     }
-    private func scheduleOffer(_ peer: UUID) {
-        offers[peer]?.cancel()
+    private func cancelOffer(_ peer: UUID) {
+        offerTokens.removeValue(forKey: peer)
+        offers.removeValue(forKey: peer)?.cancel()
+        offerBackoffs.removeValue(forKey: peer)
+    }
+    private func cancelOffers() {
+        offerTokens.removeAll()
+        for task in offers.values { task.cancel() }
+        offers.removeAll(); offerBackoffs.removeAll()
+    }
+    private func scheduleOffer(_ peer: UUID, reset: Bool = false) {
+        if reset { cancelOffer(peer) }
+        guard offers[peer] == nil, running, lan, configuration.wifi, connected.contains(peer) else { return }
+        let token = UUID(), delay = offerBackoffs[peer, default: RecoveryBackoff()].next()
+        offerTokens[peer] = token
         offers[peer] = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(5)) } catch { return }
-            guard let self, self.lan, self.configuration.wifi, self.connected.contains(peer),
-                  await self.coordinator.permitsWifi(peer), !(await self.coordinator.usingTCP(peer)) else { return }
-            do {
-                #if DEBUG
-                if let demo = self.bluetooth as? DemoPeer { try await demo.upgrade(peer); return }
-                #endif
-                let endpoints = try await self.server.start(); _ = try await self.coordinator.offerTCP(peer, addresses: endpoints)
+            guard let self else { return }
+            defer {
+                if self.offerTokens[peer] == token {
+                    self.offerTokens.removeValue(forKey: peer); self.offers.removeValue(forKey: peer)
+                    self.scheduleOffer(peer)
+                }
             }
-            catch { self.failures[peer] = error as? ProtocolFailure ?? .peerUnavailable }
+            do {
+                try await Task.sleep(for: delay)
+                guard !Task.isCancelled, self.running, self.lan, self.configuration.wifi, self.connected.contains(peer),
+                      await self.coordinator.permitsWifi(peer), !(await self.coordinator.usingTCP(peer)) else {
+                    self.cancelOffer(peer); return
+                }
+                #if DEBUG
+                if let demo = self.bluetooth as? DemoPeer { try await demo.upgrade(peer) }
+                else {
+                    let endpoints = try await self.server.start()
+                    _ = try await self.coordinator.offerTCP(peer, addresses: endpoints)
+                }
+                #else
+                let endpoints = try await self.server.start()
+                _ = try await self.coordinator.offerTCP(peer, addresses: endpoints)
+                #endif
+                try await Task.sleep(for: .seconds(10))
+            } catch is CancellationError { }
+            catch {
+                if !Task.isCancelled, self.running { self.recordFailure(peer, error as? ProtocolFailure ?? .peerUnavailable, source: .connection) }
+            }
         }
     }
     private func queueClipboard(file: URL?, text: String?, mime: String?, targets: Set<UUID>) {
@@ -648,12 +744,15 @@ public final class MacRuntime {
                             request.targets.contains($0) && self.connected.contains($0) && seen.insert($0).inserted
                         }
                         if targets.isEmpty { await self.store.release(snapshot.url) }
-                        else { try await self.coordinator.enqueue(snapshot, targets: targets, userInitiated: false) }
+                        else {
+                            try await self.coordinator.enqueue(snapshot, targets: targets, userInitiated: false)
+                            for peer in targets { self.clearFailure(peer, source: .clipboard(true)) }
+                        }
                     }
                 } catch is CancellationError { }
                 catch {
                     if !preparation.isCancelled && self.running {
-                        for peer in request.targets { self.failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable }
+                        for peer in request.targets { self.recordFailure(peer, error as? ProtocolFailure ?? .sourceUnavailable, source: .clipboard(true)) }
                     }
                 }
                 self.clipboardPreparation = nil; self.preparingClipboardTargets = []
@@ -664,15 +763,17 @@ public final class MacRuntime {
         switch event {
         case .connected(let peer):
             guard running, bluetooth.sessionAuthenticated(peer) else { return }
+            if let profile = configuration.peers.first(where: { $0.identity == peer }), profile.notifications == true {
+                await migrateNotificationIDs(profile.id)
+            }
             await coordinator.notificationPolicy(peer, enabled: configuration.peers.first(where: { $0.identity == peer })?.notifications == true)
-            failures.removeValue(forKey: peer)
-            if let device = configuration.peers.first(where: { $0.identity == peer }) { failures.removeValue(forKey: device.id) }
+            clearFailure(peer, source: .connection)
             routes[peer] = .ble; switching.remove(peer)
             connected.insert(peer); locker.connected(peer); pasteboard.start()
             synchronizeConfiguration(targets: [peer])
             if pasteboard.permitted {
                 do { let value = try pasteboard.current(); queueClipboard(file: value.0, text: value.1, mime: value.2, targets: [peer]) }
-                catch { failures[peer] = error as? ProtocolFailure ?? .sourceUnavailable }
+                catch { recordFailure(peer, error as? ProtocolFailure ?? .sourceUnavailable, source: .clipboard(true)) }
             }
             scheduleOffer(peer)
         case .disconnected(let peer, let intentional):
@@ -684,49 +785,74 @@ public final class MacRuntime {
             configurationWorkers.removeValue(forKey: peer)?.cancel(); configurationWrites.removeValue(forKey: peer)
             configurationGenerations.removeValue(forKey: peer)
             bluetooth.sessionDisconnected(peer, intentional: intentional)
-            offers.removeValue(forKey: peer)?.cancel()
+            cancelOffer(peer)
             updateNotificationCapture()
             if connected.isEmpty { pasteboard.stop(); if !isDemonstration { await server.stop() } }
         case .received(let peer, let manifest, let url):
-            stopActivity(peer, manifest.id, sending: false)
-            if manifest.kind != .file { try pasteboard.apply(manifest, file: url) }
+            guard running, bluetooth.sessionAuthenticated(peer) else { throw ProtocolFailure.peerUnavailable }
+            if manifest.kind != .file {
+                try pasteboard.apply(manifest, file: url)
+                clearFailure(peer, source: .clipboard(false))
+            } else {
+                transfers.removeValue(forKey: manifest.id); progress.removeValue(forKey: manifest.id)
+                clearFailure(peer, source: .transfer(manifest.id))
+            }
             #if DEBUG
             if isDemonstration, let count = expectedReplies[peer]?[manifest.sha256], demonstrationResult?.peer == peer {
                 if count == 1 { expectedReplies[peer]?.removeValue(forKey: manifest.sha256) } else { expectedReplies[peer]?[manifest.sha256] = count - 1 }
                 if expectedReplies[peer]?.isEmpty == true { finishDemonstration() }
             }
             #endif
-        case .progress(_, let id, let bytes, let size): progress[id] = (bytes, size); transfers[id]?.bytes = bytes
+        case .progress(let peer, let id, let bytes, let size):
+            progress[id] = (bytes, size); transfers[id]?.bytes = bytes
+            if bytes > 0, transfers[id] != nil { transfers[id]?.failure = nil; clearFailure(peer, source: .transfer(id)) }
         case .failed(let peer, let id, let code):
             #if DEBUG
             if isDemonstration, demonstrationJobs.contains(id), demonstrationResult?.peer == peer { finishDemonstration(code) }
             #endif
-            stopActivity(peer, id); failures[peer] = code; transfers[id]?.failure = code
+            let activity = activities[peer]?.first(where: { $0.id == id })
+            let source: FailureSource = id == Wire.zeroID ? .connection :
+                (transfers[id] != nil || activity?.kind == .file ? .transfer(id) : .clipboard(activity?.sending ?? true))
+            stopActivity(peer, id); recordFailure(peer, code, source: source); transfers[id]?.failure = code
+        case .upgradeRequested(let peer): scheduleOffer(peer, reset: true)
         case .wifiChanged(let peer, let enabled):
             if let index = configuration.peers.firstIndex(where: { $0.identity == peer }), configuration.peers[index].wifi != enabled {
                 configuration.peers[index].wifi = enabled; configurationChanged(devices: [peer])
             }
             if enabled { scheduleOffer(peer) }
             else {
+                cancelOffer(peer)
                 var eligible = false
                 for candidate in connected where await coordinator.permitsWifi(candidate) { eligible = true }
                 if !eligible && !isDemonstration { await server.stop() }
             }
-        case .completed(let peer, let id): stopActivity(peer, id, sending: true); progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
+        case .completed(let peer, let id):
+            let file = transfers[id] != nil
+            stopActivity(peer, id, sending: true); progress.removeValue(forKey: id); transfers.removeValue(forKey: id)
+            clearFailure(peer, source: file ? .transfer(id) : .clipboard(true))
         case .deviceInformation(let peer, let value): try acceptDeviceInformation(peer, value)
         case .transferStarted(let peer, let manifest, let sending):
             stopActivity(peer, manifest.id, sending: sending)
             activities[peer, default: []].append(LinkActivity(id: manifest.id, kind: manifest.kind, sending: sending))
-        case .transferStopped(let peer, let id): stopActivity(peer, id)
+            if manifest.kind == .file, transfers[manifest.id] == nil {
+                var transfer = MacTransfer(id: manifest.id, peer: peer, name: manifest.name, size: manifest.size)
+                transfer.sending = sending; transfers[manifest.id] = transfer
+            }
+        case .transferStopped(let peer, let id):
+            stopActivity(peer, id); transfers.removeValue(forKey: id); progress.removeValue(forKey: id)
+            clearFailure(peer, source: .transfer(id))
         case .transportChanged(let peer, let route):
+            if route == .tcp { cancelOffer(peer); clearFailure(peer, source: .connection) }
+            else if route == .ble { scheduleOffer(peer) }
             guard connected.contains(peer) else { return }
             if let route { routes[peer] = route; switching.remove(peer) }
-            else { switching.insert(peer) }
+            else { switching.insert(peer); activities.removeValue(forKey: peer) }
         case .notificationAccess(let peer, let value):
             notificationPeers[peer] = value
             updateNotificationCapture()
         case .notification(let peer, let value):
             guard running else { return }
+            clearFailure(peer, source: .notification)
             if isDemonstration {
                 if value.action == .remove { receivedNotifications.removeValue(forKey: value.id); notificationOwners.removeValue(forKey: value.id) }
                 else {

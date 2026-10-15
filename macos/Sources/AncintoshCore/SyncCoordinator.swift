@@ -6,7 +6,7 @@ public enum SyncEvent: Sendable {
     case progress(UUID, UUID, UInt64, UInt64)
     case failed(UUID, UUID, ProtocolFailure)
     case tcpOffer(UUID, TCPOffer, Data)
-    case wifiChanged(UUID, Bool)
+    case wifiChanged(UUID, Bool), upgradeRequested(UUID)
     case completed(UUID, UUID)
     case transportChanged(UUID, TransportKind?)
     case deviceInformation(UUID, DeviceInformation)
@@ -21,8 +21,9 @@ private struct Preference: Codable {
     let enabled: Bool
     let configuration: Bool?
     let notifications: NotificationAccess?
-    init(enabled: Bool, configuration: Bool? = true, notifications: NotificationAccess = NotificationAccess()) {
-        self.enabled = enabled; self.configuration = configuration; self.notifications = notifications
+    let requestTCP: Bool?
+    init(enabled: Bool, configuration: Bool? = true, notifications: NotificationAccess = NotificationAccess(), requestTCP: Bool? = nil) {
+        self.enabled = enabled; self.configuration = configuration; self.notifications = notifications; self.requestTCP = requestTCP
     }
 }
 private struct Acknowledgement: Codable { let complete: Bool }
@@ -60,7 +61,9 @@ public actor SyncCoordinator {
     private var activeSources: [UUID: URL] = [:]
     private var activeJobs: [UUID: UUID] = [:]
     private var activeCancelled: Set<UUID> = []
-    private var lastProgress: [UUID: ContinuousClock.Instant] = [:]
+    private struct ProgressKey: Hashable { let peer: UUID; let id: UUID }
+    private var lastProgress: [ProgressKey: ContinuousClock.Instant] = [:]
+    private var retiredSnapshots: Set<URL> = []
     private var localNotificationAccess = NotificationAccess()
     private var notificationQueues: [UUID: NotificationQueue] = [:]
     private var notificationOrder: [(UUID, UUID)] = []
@@ -73,7 +76,8 @@ public actor SyncCoordinator {
     }
 
     public func restore() async throws {
-        for job in try await store.restoreOutgoing() { scheduler.enqueue(job) }
+        for job in try await store.restoreOutgoing() where !scheduler.jobs.contains(where: { $0.peer == job.peer && $0.manifest.id == job.manifest.id }) { scheduler.enqueue(job) }
+        await store.collectOutgoing(keeping: Set(scheduler.jobs.map(\.snapshot)).union(activeSources.values))
     }
 
     public func connectedPeers() -> Set<UUID> { Set(peers.keys) }
@@ -92,7 +96,7 @@ public actor SyncCoordinator {
     }
     public func reportDevice(_ value: DeviceInformation, to peer: UUID) async throws {
         guard role == .android, let entry = peers[peer], entry.supportsConfiguration else { throw ProtocolFailure.peerUnavailable }
-        try await entry.ble.send(Record(.deviceInformation, metadata: Wire.encodeJSON(value)))
+        try await entry.ble.reply(Record(.deviceInformation, metadata: Wire.encodeJSON(value)))
     }
 
     public func notificationAccess(_ value: NotificationAccess) async {
@@ -100,7 +104,7 @@ public actor SyncCoordinator {
         localNotificationAccess = value
         for (peer, entry) in peers {
             if !value.capture { clearNotifications(peer) }
-            try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: NotificationAccess(capture: value.capture, display: value.display, enabled: entry.notificationsEnabled)))))
+            try? await entry.ble.reply(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: NotificationAccess(capture: value.capture, display: value.display, enabled: entry.notificationsEnabled)))))
         }
     }
     public func notificationPolicy(_ peer: UUID, enabled: Bool) async {
@@ -108,7 +112,7 @@ public actor SyncCoordinator {
         entry.notificationsEnabled = enabled; peers[peer] = entry
         if !enabled { clearNotifications(peer) }
         let access = NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: enabled)
-        try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: access))))
+        try? await entry.ble.reply(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: access))))
     }
     public func enqueueNotification(_ value: NotificationMessage, to peer: UUID) throws {
         guard let entry = peers[peer], entry.notificationsEnabled, entry.notificationAccess?.display == true,
@@ -166,7 +170,9 @@ public actor SyncCoordinator {
         peers[peer] = entry
         await store.selectEpoch(peer: peer, epoch: entry.epoch)
         await channel.setDataEpoch(entry.epoch)
+        let previousSnapshots = Set(scheduler.jobs.map(\.snapshot))
         scheduler.reconnect(peer)
+        await retire(previousSnapshots)
         let generation = entry.generation
         Task { await self.readLoop(peer, channel: channel, generation: generation, tcp: false) }
         try await channel.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: localWifi, notifications: NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: false)))))
@@ -236,7 +242,7 @@ public actor SyncCoordinator {
             entry.route.preference(local: enabled)
             peers[id] = entry
             if !enabled { await fallback(id) }
-            try? await entry.ble.send(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: enabled, notifications: NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: entry.notificationsEnabled)))))
+            try? await entry.ble.reply(Record(.wifiPreference, metadata: Wire.encodeJSON(Preference(enabled: enabled, notifications: NotificationAccess(capture: localNotificationAccess.capture, display: localNotificationAccess.display, enabled: entry.notificationsEnabled)))))
         }
         schedulePump()
     }
@@ -255,7 +261,10 @@ public actor SyncCoordinator {
         try? await store.checkpoint(peer)
         await entry.ble.close(); await entry.tcp?.close()
         if peers.isEmpty { await store.closeHandles() }
+        let previousSnapshots = Set(scheduler.jobs.map(\.snapshot))
         scheduler.reconnect(peer)
+        lastProgress = lastProgress.filter { $0.key.peer != peer }
+        await retire(previousSnapshots)
         try? await store.persistOutgoing(scheduler.jobs)
         if peers[peer] == nil { try? await events(.disconnected(peer, intentional: intentional)) }
     }
@@ -266,8 +275,7 @@ public actor SyncCoordinator {
             scheduler.enqueue(OutboundJob(peer: peer, manifest: snapshot.manifest, snapshot: snapshot.url, userInitiated: userInitiated))
         }
         try await store.persistOutgoing(scheduler.jobs)
-        let retained = Set(scheduler.jobs.map(\.snapshot))
-        for url in previous.subtracting(retained) where url.path.contains("/outgoing/") { await store.release(url) }
+        await retire(previous)
         schedulePump()
     }
 
@@ -276,14 +284,15 @@ public actor SyncCoordinator {
         if cancelsActive { activeCancelled.insert(peer) }
         let previous = scheduler.jobs.first(where: { $0.peer == peer && $0.manifest.id == id })?.snapshot ?? (cancelsActive ? activeSources[peer] : nil)
         scheduler.remove(id, peer: peer)
+        await store.cancel(peer: peer, id: id)
         try? await events(.transferStopped(peer, id))
         try? await store.persistOutgoing(scheduler.jobs)
         if let channel = dataChannel(peer), let epoch = peers[peer]?.epoch {
             await channel.discardBuffered(id)
-            try? await channel.send(Record(.cancel, transferID: id, epoch: epoch))
+            try? await channel.reply(Record(.cancel, transferID: id, epoch: epoch))
         }
-        await store.cancel(peer: peer, id: id)
-        if let previous, !scheduler.jobs.contains(where: { $0.snapshot == previous }), previous.path.contains("/outgoing/") { await store.release(previous) }
+        if let previous { await retire([previous]) }
+        lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: id))
         schedulePump()
     }
 
@@ -306,7 +315,6 @@ public actor SyncCoordinator {
             guard let entry = peers[peer], (tcp ? entry.tcpGeneration : entry.generation) == generation else { return }
             if tcp {
                 await fallback(peer)
-                try? await events(.wifiChanged(peer, false))
                 schedulePump()
             } else { await disconnect(peer) }
         }
@@ -322,15 +330,21 @@ public actor SyncCoordinator {
                 let manifest = try Wire.decodeJSON(TransferManifest.self, record.metadata)
                 guard manifest.id == record.transferID else { throw ProtocolFailure.invalidManifest }
                 let offset = try await store.begin(manifest, peer: peer, epoch: record.epoch)
+                guard peers[peer]?.epoch == record.epoch, channel === dataChannel(peer), peers[peer]?.switching == false else { return }
                 try await events(.transferStarted(peer, manifest, sending: false))
-                try await channel.send(Record(.resume, transferID: manifest.id, offset: offset, epoch: record.epoch))
+                try await events(.progress(peer, manifest.id, offset, manifest.size))
+                try await channel.reply(Record(.resume, transferID: manifest.id, offset: offset, epoch: record.epoch))
             case .data:
                 if let durable = try await store.append(peer: peer, id: record.transferID, offset: record.offset, bytes: record.bytes, epoch: record.epoch) {
-                    try await channel.send(Record(.acknowledge, transferID: record.transferID, offset: durable,
+                    try await channel.reply(Record(.acknowledge, transferID: record.transferID, offset: durable,
                                                   metadata: Wire.encodeJSON(Acknowledgement(complete: false)), epoch: record.epoch))
+                }
+                if let size = await store.incomingSize(peer: peer, id: record.transferID) {
+                    try await reportProgress(peer, id: record.transferID, offset: record.offset + UInt64(record.bytes.count), size: size)
                 }
             case .finish:
                 let (manifest, url, new) = try await store.finish(peer: peer, id: record.transferID, epoch: record.epoch)
+                guard peers[peer]?.epoch == record.epoch, channel === dataChannel(peer), peers[peer]?.switching == false else { return }
                 if new {
                     try await events(.received(peer, manifest, url))
                     try await store.delivered(peer: peer, id: manifest.id)
@@ -346,8 +360,9 @@ public actor SyncCoordinator {
                         }
                     }
                 }
-                try await channel.send(Record(.acknowledge, transferID: manifest.id, offset: manifest.size,
+                try await channel.reply(Record(.acknowledge, transferID: manifest.id, offset: manifest.size,
                                               metadata: Wire.encodeJSON(Acknowledgement(complete: true)), epoch: record.epoch))
+                lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: manifest.id))
                 try await events(.transferStopped(peer, manifest.id))
             case .resume:
                 try scheduler.resume(record.transferID, peer: peer, offset: record.offset)
@@ -358,9 +373,8 @@ public actor SyncCoordinator {
                         guard record.offset == job.manifest.size else { throw ProtocolFailure.invalidOffset }
                         scheduler.remove(record.transferID, peer: peer)
                         try await store.persistOutgoing(scheduler.jobs)
-                        if !scheduler.jobs.contains(where: { $0.snapshot == job.snapshot }) && job.snapshot.path.contains("/outgoing/") {
-                            await store.release(job.snapshot)
-                        }
+                        await retire([job.snapshot])
+                        lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: record.transferID))
                         try await events(.completed(peer, record.transferID))
                         await collectClipboard()
                     }
@@ -368,7 +382,11 @@ public actor SyncCoordinator {
             case .cancel:
                 try await events(.transferStopped(peer, record.transferID))
                 if activeJobs[peer] == record.transferID { activeCancelled.insert(peer) }
+                let previous = Set(scheduler.jobs.map(\.snapshot))
                 scheduler.remove(record.transferID, peer: peer)
+                await channel.discardBuffered(record.transferID)
+                await retire(previous)
+                lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: record.transferID))
                 await store.cancel(peer: peer, id: record.transferID)
                 try await store.persistOutgoing(scheduler.jobs)
             case .wifiPreference:
@@ -384,6 +402,7 @@ public actor SyncCoordinator {
                 if configurationReady { try await events(.configurationReady(peer)) }
                 if !preference.enabled { await fallback(peer) }
                 try await events(.wifiChanged(peer, preference.enabled))
+                if preference.requestTCP == true { try await events(.upgradeRequested(peer)) }
             case .tcpOffer:
                 guard role == .android, !tcp, var entry = peers[peer], permitsWifi(peer) else { throw ProtocolFailure.invalidFrame }
                 let offer = try Wire.decodeJSON(TCPOffer.self, record.metadata)
@@ -421,6 +440,7 @@ public actor SyncCoordinator {
                 let failure = try Wire.decodeJSON(FailureMessage.self, record.metadata)
                 scheduler.fail(record.transferID, peer: peer, error: failure.code)
                 try await store.persistOutgoing(scheduler.jobs)
+                lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: record.transferID))
                 try await events(.failed(peer, record.transferID, failure.code))
             case .deviceInformation:
                 guard role == .mac, !tcp else { throw ProtocolFailure.invalidFrame }
@@ -429,7 +449,7 @@ public actor SyncCoordinator {
                 peers[peer]?.supportsConfiguration = true
                 do { try await events(.deviceInformation(peer, information)) }
                 catch let failure as ProtocolFailure {
-                    try await channel.send(Record(.failure, transferID: information.renameRequest ?? Wire.zeroID,
+                    try await channel.reply(Record(.failure, transferID: information.renameRequest ?? Wire.zeroID,
                         metadata: Wire.encodeJSON(FailureMessage(code: failure, configuration: true))))
                 }
             case .configuration:
@@ -448,14 +468,16 @@ public actor SyncCoordinator {
         } catch let failure as ProtocolFailure {
             if isTransfer && record.epoch != peers[peer]?.epoch { return }
             if [.begin, .data, .finish, .resume].contains(record.kind) {
-                try await channel.send(Record(.failure, transferID: record.transferID, metadata: Wire.encodeJSON(FailureMessage(code: failure)), epoch: record.epoch))
+                lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: record.transferID))
+                try await channel.reply(Record(.failure, transferID: record.transferID, metadata: Wire.encodeJSON(FailureMessage(code: failure)), epoch: record.epoch))
                 try await events(.failed(peer, record.transferID, failure))
             } else { throw failure }
         } catch {
             if [.begin, .data, .finish].contains(record.kind) {
                 let native = error as NSError
                 let failure: ProtocolFailure = native.code == ENOSPC || native.code == NSFileWriteOutOfSpaceError ? .insufficientSpace : .sourceUnavailable
-                try await channel.send(Record(.failure, transferID: record.transferID, metadata: Wire.encodeJSON(FailureMessage(code: failure)), epoch: record.epoch))
+                lastProgress.removeValue(forKey: ProgressKey(peer: peer, id: record.transferID))
+                try await channel.reply(Record(.failure, transferID: record.transferID, metadata: Wire.encodeJSON(FailureMessage(code: failure)), epoch: record.epoch))
                 try await events(.failed(peer, record.transferID, failure))
             } else { throw error }
         }
@@ -475,11 +497,34 @@ public actor SyncCoordinator {
         }
     }
 
+    private func reportProgress(_ peer: UUID, id: UUID, offset: UInt64, size: UInt64) async throws {
+        let key = ProgressKey(peer: peer, id: id), now = ContinuousClock.now
+        if offset == size || lastProgress[key].map({ $0.duration(to: now) >= .milliseconds(200) }) ?? true {
+            lastProgress[key] = now
+            try await events(.progress(peer, id, offset, size))
+        }
+    }
+    private func retire(_ previous: Set<URL>) async {
+        let queued = Set(scheduler.jobs.map(\.snapshot))
+        let outgoing = store.root.appendingPathComponent("outgoing").resolvingSymlinksInPath().standardizedFileURL
+        retiredSnapshots.formUnion(previous.subtracting(queued).filter { $0.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL == outgoing })
+        while true {
+            let held = Set((scheduler.jobs.map(\.snapshot) + Array(activeSources.values)).map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
+            let releasable = retiredSnapshots.filter { !held.contains($0.resolvingSymlinksInPath().standardizedFileURL.path) }
+            if releasable.isEmpty { return }
+            for url in releasable {
+                retiredSnapshots.remove(url)
+                await store.release(url)
+            }
+        }
+    }
+
     private func collectClipboard() async {
         var retained = Set(scheduler.jobs.map(\.snapshot))
         if let currentClipboard { retained.insert(currentClipboard) }
         retained.formUnion(activeSources.values)
         await store.collectClipboard(keeping: retained)
+        await retire([])
     }
 
     private func fallback(_ peer: UUID) async {
@@ -535,15 +580,24 @@ public actor SyncCoordinator {
             }
         }
         while !Task.isCancelled, peers[peer]?.switching == false,
-              var job = scheduler.next(available: [peer], includeFiles: scheduler.firstFilePeer(available: Set(peers.keys)) == peer) {
+              var job = scheduler.next(available: [peer], includeFiles: scheduler.firstFilePeer(available: Set(peers.filter { !$0.value.switching }.keys)) == peer) {
             activeJobs[peer] = job.manifest.id; activeCancelled.remove(peer)
             activeSources[peer] = job.snapshot
             guard let channel = dataChannel(job.peer) else { scheduler.requeue(job); return }
             guard let epoch = peers[job.peer]?.epoch else { scheduler.requeue(job); return }
             do {
                 if !job.begun {
+                    // Keep the job owned while a platform event crosses an actor boundary.
+                    scheduler.requeue(job)
                     try await events(.transferStarted(peer, job.manifest, sending: true))
+                    guard !activeCancelled.contains(peer), epoch == peers[peer]?.epoch,
+                          channel === dataChannel(peer), peers[peer]?.switching == false,
+                          scheduler.jobs.contains(where: { $0.peer == peer && $0.manifest.id == job.manifest.id }) else {
+                        try? await events(.transferStopped(peer, job.manifest.id))
+                        await retire([job.snapshot]); return
+                    }
                     job.begun = true; job.waitingForResume = true
+                    scheduler.remove(job.manifest.id, peer: peer)
                     scheduler.requeue(job)
                     try await channel.send(Record(.begin, transferID: job.manifest.id, metadata: Wire.encodeJSON(job.manifest), epoch: epoch))
                 } else if job.offset < job.manifest.size {
@@ -558,14 +612,12 @@ public actor SyncCoordinator {
                     }
                     if activeCancelled.contains(peer) { continue }
                     if epoch != peers[peer]?.epoch || channel !== dataChannel(peer) { continue }
+                    guard let current = scheduler.jobs.first(where: { $0.peer == peer && $0.manifest.id == job.manifest.id }),
+                          current.failure == nil, current.begun, !current.waitingForResume, current.offset == job.offset else { continue }
                     scheduler.remove(job.manifest.id, peer: peer)
-                    job.offset += UInt64(sent)
+                    job = current; job.offset += UInt64(sent)
                     scheduler.requeue(job)
-                    let now = ContinuousClock.now
-                    if job.offset == job.manifest.size || lastProgress[job.manifest.id].map({ $0.duration(to: now) >= .milliseconds(200) }) ?? true {
-                        lastProgress[job.manifest.id] = now
-                        try await events(.progress(job.peer, job.manifest.id, job.offset, job.manifest.size))
-                    }
+                    try await reportProgress(job.peer, id: job.manifest.id, offset: job.offset, size: job.manifest.size)
                 } else {
                     job.finished = true
                     scheduler.requeue(job)
@@ -580,6 +632,7 @@ public actor SyncCoordinator {
                         scheduler.requeue(job)
                         try? await store.persistOutgoing(scheduler.jobs)
                     }
+                    lastProgress.removeValue(forKey: ProgressKey(peer: job.peer, id: job.manifest.id))
                     try? await events(.failed(job.peer, job.manifest.id, .sourceUnavailable))
                 } else {
                     scheduler.channelChanged(job.peer)
